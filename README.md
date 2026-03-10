@@ -94,8 +94,8 @@ python topstep_bot.py
 
 | Step | Cost | Expected Return |
 |------|------|-----------------|
-| Combine fee | -$150 | |
+| Combine fee | -$50 | |
 | Eval pass (90.8%) | | |
 | Activation fee | -$150 | |
 | Funded payouts | | +$3,977 |
-| **Net EV per attempt** | | **~$3,400** |
+| **Net EV per attempt** | | **~$3,500** |
