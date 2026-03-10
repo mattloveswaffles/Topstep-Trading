@@ -73,3 +73,29 @@ python topstep_bot.py
 - **Consistency rule:** Must have 5 winning days ($150+ PnL each) before requesting a payout. Days do not need to be consecutive. Counter resets after each payout.
 - **Max payout:** $5,000 or 50% of profit balance (whichever is less)
 - **Processing:** Payouts requested through TopstepX dashboard
+
+## Expected Returns (Monte Carlo, 50K sims)
+
+### Eval Phase
+
+- **Pass rate:** 90.8%
+- **Avg calendar days to pass:** ~10
+- **Avg profit on pass:** $3,932
+
+### Funded Phase
+
+- **95%** of funded accounts get at least 1 payout
+- **7 trading days** to first payout on average
+- **$2,032** average per payout
+- **2 payouts** on average before bust
+- **$3,977** total extracted on average
+
+### Full Cycle EV
+
+| Step | Cost | Expected Return |
+|------|------|-----------------|
+| Combine fee | -$150 | |
+| Eval pass (90.8%) | | |
+| Activation fee | -$150 | |
+| Funded payouts | | +$3,977 |
+| **Net EV per attempt** | | **~$3,400** |
