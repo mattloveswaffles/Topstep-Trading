@@ -1,4 +1,4 @@
-# Topstep NQ Futures Trading Bot
+# Topstep NQ Futures Trading Bot - Current Implementation Results
 
 Automated VWAP Mean-Reversion strategy for passing Topstep 50K Combine evaluations on NQ (Nasdaq-100 E-mini) futures.
 
