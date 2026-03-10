@@ -62,6 +62,7 @@ class Phase(str, Enum):
 POINT_VALUE = 20.0            # NQ $20 per point
 TICK_SIZE = 0.25              # NQ min tick
 TICK_VALUE = 5.0              # $5 per tick
+START_BALANCE = 50000.0       # Topstep 50K combine starting balance
 EVAL_PROFIT_TARGET = 3000.0
 EVAL_TRAILING_DD = 2000.0
 DAILY_LOSS_LIMIT = 1000.0
@@ -332,14 +333,32 @@ class ProjectXAPI:
         """Get open positions for an account."""
         self.ensure_auth()
         resp = self.session.post(
-            f"{self.BASE_URL}/api/Position/search",
+            f"{self.BASE_URL}/api/Position/searchOpen",
             json={"accountId": account_id},
         )
         resp.raise_for_status()
+        if not resp.text or not resp.text.strip():
+            return []  # no positions
         data = resp.json()
         if isinstance(data, list):
             return data
         return data.get("positions", data.get("data", []))
+
+    def get_trades(self, account_id: int, start_timestamp: str) -> List[Dict]:
+        """Search trades for an account from a given start time."""
+        self.ensure_auth()
+        resp = self.session.post(
+            f"{self.BASE_URL}/api/Trade/search",
+            json={
+                "accountId": account_id,
+                "startTimestamp": start_timestamp,
+            },
+        )
+        resp.raise_for_status()
+        if not resp.text or not resp.text.strip():
+            return []
+        data = resp.json()
+        return data.get("trades", [])
 
     # ── Market Data ───────────────────────────────────────────────────
 
@@ -866,6 +885,74 @@ class TradingEngine:
         mins = dt_et.hour * 60 + dt_et.minute
         return 15 * 60 + 55 <= mins <= 16 * 60
 
+    # ── API Sync (source of truth) ───────────────────────────────────
+
+    def _sync_from_api(self, acc: AccountState):
+        """Sync position, PnL, and equity from the platform API."""
+        try:
+            # Sync position from open positions
+            positions = self.api.get_positions(acc.account_id)
+            if positions:
+                nq_pos = None
+                for p in positions:
+                    if p.get("contractId") == acc.contract_id:
+                        nq_pos = p
+                        break
+                if nq_pos:
+                    size = int(nq_pos.get("size", 0))
+                    if acc.position == 0 and size != 0:
+                        log.warning(
+                            f"API sync: detected position {size} "
+                            f"but bot thinks flat"
+                        )
+                    acc.position = size
+                else:
+                    if acc.position != 0:
+                        log.warning(
+                            "API sync: no NQ position, syncing to flat"
+                        )
+                    acc.position = 0
+                    acc.entry_price = 0.0
+            else:
+                if acc.position != 0:
+                    log.warning(
+                        "API sync: no positions, syncing to flat"
+                    )
+                acc.position = 0
+                acc.entry_price = 0.0
+
+            # Sync equity from account balance
+            accounts = self.api.get_accounts()
+            for a in accounts:
+                if a.get("id") == acc.account_id:
+                    api_balance = a.get("balance")
+                    if api_balance is not None:
+                        bal = float(api_balance)
+                        acc.equity = bal - START_BALANCE
+                        acc.peak = max(acc.peak, acc.equity)
+                    break
+
+            # Sync daily PnL from trades (source of truth)
+            today_start = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT00:00:00Z"
+            )
+            trades = self.api.get_trades(acc.account_id, today_start)
+            total_pnl = 0.0
+            total_fees = 0.0
+            trade_count = 0
+            for t in trades:
+                pnl = t.get("profitAndLoss")
+                if pnl is not None:
+                    total_pnl += float(pnl)
+                    trade_count += 1
+                total_fees += float(t.get("fees", 0))
+            acc.daily_pnl = total_pnl - total_fees
+            # Trade count: completed exits + 1 if currently in a position
+            acc.trades_today = trade_count + (1 if acc.position != 0 else 0)
+
+        except Exception as e:
+            log.debug(f"API sync failed for acct {acc.account_id}: {e}")
+
     # ── Daily Reset ───────────────────────────────────────────────────
 
     def _check_new_day(self):
@@ -882,6 +969,9 @@ class TradingEngine:
                 acc.daily_pnl = 0.0
                 acc.trades_today = 0
                 acc.entered_today = False
+                # Reset day start balance for daily PnL tracking
+                if hasattr(acc, '_day_start_balance'):
+                    del acc._day_start_balance
                 log.info(f"Account {acc.account_id}: new day {today_str}")
 
     # ── Build Daily Bars for Alpha Signal ─────────────────────────────
@@ -1069,7 +1159,7 @@ class TradingEngine:
                 entry_price=current_price,
                 stop_pts=EVAL_CONFIG["stop_pts"],
                 target_pts=EVAL_CONFIG["target_pts"],
-                stop_ticks=stop_ticks,
+                stop_ticks=-stop_ticks,
                 target_ticks=target_ticks,
             )
         elif (not EVAL_CONFIG.get("long_only", True)
@@ -1082,7 +1172,7 @@ class TradingEngine:
                 stop_pts=EVAL_CONFIG["stop_pts"],
                 target_pts=EVAL_CONFIG["target_pts"],
                 stop_ticks=stop_ticks,
-                target_ticks=target_ticks,
+                target_ticks=-target_ticks,
             )
 
     def _trade_funded(self, acc: AccountState):
@@ -1160,6 +1250,10 @@ class TradingEngine:
                 f"OPENED: Acct {acc.account_id} | {side_str} {contracts}x NQ @ ~{entry_price:.2f} | "
                 f"SL={acc.stop_price:.2f} TP={acc.target_price:.2f}"
             )
+
+            # Sync actual position from API
+            time.sleep(0.5)  # brief wait for fill
+            self._sync_from_api(acc)
         except Exception as e:
             log.error(f"Order failed on acct {acc.account_id}: {e}")
             acc.last_error = str(e)
@@ -1172,10 +1266,7 @@ class TradingEngine:
         try:
             side = OrderSide.ASK if acc.position > 0 else OrderSide.BID
             contracts = abs(acc.position)
-
-            # Get approximate exit price from latest bar
-            bars = self._get_today_bars(self._now_et())
-            exit_price = _bar_close(bars[-1]) if bars else acc.entry_price
+            side_str = "SELL" if acc.position > 0 else "BUY"
 
             self.api.place_market_order(
                 account_id=acc.account_id,
@@ -1184,24 +1275,9 @@ class TradingEngine:
                 size=contracts,
             )
 
-            # Calculate PnL
-            pnl = (exit_price - acc.entry_price) * POINT_VALUE * contracts
-            if acc.position < 0:
-                pnl = -pnl
-
-            # Cap at daily loss limit
-            if acc.daily_pnl + pnl < -DAILY_LOSS_LIMIT:
-                pnl = -DAILY_LOSS_LIMIT - acc.daily_pnl
-
-            acc.daily_pnl += pnl
-            acc.equity += pnl
-            acc.peak = max(acc.peak, acc.equity)
-            acc.profit_since_payout += pnl
-
-            side_str = "SELL" if acc.position > 0 else "BUY"
             log.info(
-                f"CLOSED: Acct {acc.account_id} | {reason} | {side_str} {contracts}x NQ @ ~{exit_price:.2f} | "
-                f"PnL=${pnl:+,.2f} | Equity=${acc.equity:,.2f}"
+                f"CLOSED: Acct {acc.account_id} | {reason} | "
+                f"{side_str} {contracts}x NQ"
             )
 
             acc.position = 0
@@ -1209,6 +1285,10 @@ class TradingEngine:
             acc.stop_price = 0.0
             acc.highest_price_since_entry = 0.0
             acc.target_price = 0.0
+
+            # Sync real PnL/equity from API
+            time.sleep(0.5)  # brief wait for fill
+            self._sync_from_api(acc)
 
             # Check trailing DD bust
             drawdown = acc.peak - acc.equity
@@ -1322,9 +1402,19 @@ class TradingEngine:
         # Header row
         market_str = "[bold green]OPEN[/]" if market_open else "[bold red]CLOSED[/]"
         session_str = "[green]IN SESSION[/]" if in_session else "[dim]OUT[/]"
+        # Position indicator from first account
+        pos_str = "[dim]FLAT[/]"
+        for acc in self.accounts.values():
+            if acc.position > 0:
+                pos_str = f"[bold green]{acc.position}x LONG @ {acc.entry_price:,.2f}[/]"
+            elif acc.position < 0:
+                pos_str = f"[bold red]{abs(acc.position)}x SHORT @ {acc.entry_price:,.2f}[/]"
+            break
+
         header = Text.from_markup(
             f" [bold]TopstepX Bot[/]  |  {now.strftime('%Y-%m-%d %H:%M:%S ET')}  |  "
-            f"Market: {market_str}  |  Session: {session_str}  |  {self.contract_name}"
+            f"Market: {market_str}  |  Session: {session_str}  |  "
+            f"Position: {pos_str}  |  {self.contract_name}"
         )
         outer.add_row(header)
         outer.add_row(Text(""))
@@ -1406,6 +1496,80 @@ class TradingEngine:
             )
 
         outer.add_row(acct_table)
+        outer.add_row(Text(""))
+
+        # Trade history from API
+        try:
+            today_start = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT00:00:00Z"
+            )
+            for acc in self.accounts.values():
+                trades = self.api.get_trades(
+                    acc.account_id, today_start
+                )
+                if trades:
+                    trade_table = Table(
+                        show_lines=False, expand=True,
+                        title="Today's Trades",
+                        title_style="bold cyan",
+                    )
+                    trade_table.add_column("Time (ET)", ratio=2)
+                    trade_table.add_column("Side", justify="center", ratio=1)
+                    trade_table.add_column("Size", justify="center", ratio=1)
+                    trade_table.add_column("Price", justify="right", ratio=2)
+                    trade_table.add_column("PnL", justify="right", ratio=2)
+                    trade_table.add_column("Fees", justify="right", ratio=1)
+
+                    from zoneinfo import ZoneInfo
+                    et = ZoneInfo("America/New_York")
+                    # Only show trades with PnL (exits)
+                    exit_trades = [
+                        t for t in trades
+                        if t.get("profitAndLoss") is not None
+                    ]
+                    for t in exit_trades:
+                        ts = pd.to_datetime(t["creationTimestamp"])
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        ts_et = ts.astimezone(et)
+                        time_str = ts_et.strftime("%H:%M:%S")
+                        side_str = "BUY" if t["side"] == 0 else "SELL"
+                        side_style = "green" if t["side"] == 0 else "red"
+                        price_str = f"{t['price']:,.2f}"
+                        pnl = float(t["profitAndLoss"])
+                        fees = float(t.get("fees", 0))
+                        net = pnl - fees
+                        net_style = "green" if net >= 0 else "red"
+                        trade_table.add_row(
+                            time_str,
+                            f"[{side_style}]{side_str}[/]",
+                            str(t["size"]),
+                            price_str,
+                            f"[{net_style}]${pnl:+,.2f}[/]",
+                            f"${fees:.2f}",
+                        )
+                    # Summary row
+                    if exit_trades:
+                        total_pnl = sum(
+                            float(t["profitAndLoss"])
+                            for t in exit_trades
+                        )
+                        total_fees = sum(
+                            float(t.get("fees", 0))
+                            for t in exit_trades
+                        )
+                        net_total = total_pnl - total_fees
+                        ns = "green" if net_total >= 0 else "red"
+                        trade_table.add_row(
+                            "[bold]TOTAL[/]", "", "",  "",
+                            f"[bold {ns}]${net_total:+,.2f}[/]",
+                            f"${total_fees:.2f}",
+                        )
+
+                    outer.add_row(trade_table)
+                break  # only first account
+        except Exception:
+            pass  # don't crash dashboard if trade fetch fails
 
         return outer
 
@@ -1446,6 +1610,10 @@ class TradingEngine:
                                 except Exception as e:
                                     log.error(f"Trade error on acct {acc.account_id}: {e}")
                                     acc.last_error = str(e)
+
+                        # Sync account state from API each cycle
+                        for acc in self.accounts.values():
+                            self._sync_from_api(acc)
 
                         live.update(self._build_dashboard())
                         self._save_state()
