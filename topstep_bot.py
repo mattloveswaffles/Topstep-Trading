@@ -640,7 +640,7 @@ class AccountState:
     highest_price_since_entry: float = 0.0
     stop_order_id: Optional[int] = None   # exchange stop order ID for trail modification
     trades_today: int = 0
-    cooldown_until: Optional[datetime] = None  # block entries after a loss for 15 min
+    cooldown_until: Optional[datetime] = None  # block entries after a loss for 180 min
 
     # VWAP MR state (eval)
     bars_5m: list = field(default_factory=list)
@@ -1087,9 +1087,9 @@ class TradingEngine:
             acc.rt_trades_today.append(data)
             log.info(f"RT trade: acct {acc_id} | PnL=${float(pnl):+,.2f} fees=${fees:.2f} net=${net:+,.2f}")
 
-            # 15-minute cooldown after a losing trade
+            # 180-minute cooldown after a losing trade
             if net < 0:
-                acc.cooldown_until = self._now_et() + timedelta(minutes=15)
+                acc.cooldown_until = self._now_et() + timedelta(minutes=180)
                 log.info(f"Loss cooldown: acct {acc_id} | no entries until {acc.cooldown_until.strftime('%H:%M')}")
 
             # Update trade count
@@ -1439,7 +1439,7 @@ class TradingEngine:
         if acc.trades_today >= EVAL_CONFIG["max_trades_per_day"]:
             return
 
-        # 15-minute cooldown after a losing trade
+        # 180-minute cooldown after a losing trade
         if acc.cooldown_until is not None and now < acc.cooldown_until:
             return
 
