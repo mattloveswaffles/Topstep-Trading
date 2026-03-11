@@ -497,6 +497,7 @@ def run_topstep_nq(
     long_only: bool = True,
     rsi_overbought_min: Optional[float] = 55.0,
     trailing_stop_pts: Optional[float] = None,
+    cooldown_after_loss_minutes: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
     Topstep-style NQ strategies with fixed-point brackets (stop_pts / target_pts).
@@ -581,6 +582,7 @@ def run_topstep_nq(
     trades_today = 0
     day_realized_pnl = 0.0
     last_day: Optional[str] = None
+    cooldown_until = None  # timestamp until which entries are blocked after a loss
     n = len(df)
 
     for k in range(n):
@@ -612,6 +614,9 @@ def run_topstep_nq(
                     "cumulative_pnl": cum_pnl, "trading_day": day,
                     "side": "long" if position > 0 else "short",
                 })
+                # Set cooldown after a losing trade
+                if cooldown_after_loss_minutes is not None and pnl < 0:
+                    cooldown_until = ts + pd.Timedelta(minutes=cooldown_after_loss_minutes)
                 position = 0
                 entry_price = stop_level = target_level = partial_target_level = None
                 partial_taken = False
@@ -639,7 +644,8 @@ def run_topstep_nq(
             effective_max_trades = min(effective_max_trades, 2) if effective_max_trades is not None else 2
         trades_ok = effective_max_trades is None or trades_today < effective_max_trades
         daily_stop_ok = daily_stop_loss is None or day_realized_pnl > -daily_stop_loss
-        can_trade = trades_ok and daily_stop_ok
+        cooldown_ok = cooldown_until is None or ts >= cooldown_until
+        can_trade = trades_ok and daily_stop_ok and cooldown_ok
 
         # Entry logic by strategy
         long_signal = False
@@ -922,6 +928,9 @@ def run_topstep_nq(
                 "side": "long" if is_long else "short",
             })
             trades_today += 1
+            # Set cooldown after a losing trade
+            if cooldown_after_loss_minutes is not None and pnl < 0:
+                cooldown_until = ts + pd.Timedelta(minutes=cooldown_after_loss_minutes)
             position = 0
             entry_price = stop_level = target_level = partial_target_level = None
             partial_taken = False

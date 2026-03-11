@@ -43,6 +43,7 @@ from engine.backtest import (
     DAILY_LOSS_LIMIT,
     POINT_VALUE,
 )
+from engine.alpha import load_daily, signal_to_trades, ALPHAS
 
 warnings.filterwarnings("ignore")
 console = Console()
@@ -88,6 +89,8 @@ class Strategy:
     max_trades_per_day: int = 5
     trailing_stop_pts: Optional[float] = 2.0
     long_only: bool = False
+    alpha_fn: Optional[str] = None  # Alpha function name (e.g., "Alpha#44") for alpha strategies
+    cooldown_after_loss_minutes: Optional[int] = None  # Minutes to wait after a losing trade
 
 
 # ── Register your strategies here ────────────────────────────────────────
@@ -172,6 +175,85 @@ register_strategy(
     },
 )
 
+# Alpha#44: -correlation(high, rank(volume), 5) — daily signal strategy
+register_strategy(
+    name="alpha44",
+    description="Alpha#44 — daily signal, long when -corr(high, rank(vol), 5) > 0",
+    strategy_type="alpha",
+    alpha_fn="Alpha#44",
+)
+
+# ── 15-min cooldown after loss variants ──────────────────────────────────
+
+register_strategy(
+    name="vwap_mr_cd15",
+    description="VWAP MR + 15min cooldown after loss",
+    strategy_type="vwap_micro",
+    stop_pts=5.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=15 * 60 + 45,
+    trailing_stop_pts=2.0,
+    long_only=False,
+    cooldown_after_loss_minutes=15,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 1.5,
+        "min_down_bar_pts": 0.5,
+        "rsi_oversold_max": 50.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
+register_strategy(
+    name="vwap_mr_conservative_cd15",
+    description="VWAP MR Conservative + 15min cooldown after loss",
+    strategy_type="vwap_micro",
+    stop_pts=5.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=12 * 60,
+    trailing_stop_pts=3.0,
+    long_only=True,
+    cooldown_after_loss_minutes=15,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 2.0,
+        "min_down_bar_pts": 0.5,
+        "rsi_oversold_max": 40.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
+register_strategy(
+    name="vwap_mr_aggressive_cd15",
+    description="VWAP MR Aggressive + 15min cooldown after loss",
+    strategy_type="vwap_micro",
+    stop_pts=5.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=15 * 60 + 45,
+    trailing_stop_pts=None,
+    long_only=False,
+    cooldown_after_loss_minutes=15,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 1.0,
+        "min_down_bar_pts": 0.25,
+        "rsi_oversold_max": 50.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Data Loading
@@ -229,8 +311,23 @@ def run_backtest(
     df: pd.DataFrame,
     strategy: Strategy,
     volume_col: Optional[str] = None,
+    daily_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """Run a strategy backtest, returning (bar_df, trades_df, final_pnl)."""
+
+    # Alpha-based strategies use daily signal pipeline
+    if strategy.strategy_type == "alpha" and strategy.alpha_fn:
+        if daily_df is None:
+            daily_df = load_daily()
+        alpha_func = ALPHAS.get(strategy.alpha_fn)
+        if alpha_func is None:
+            raise ValueError(f"Unknown alpha: {strategy.alpha_fn}")
+        signal = alpha_func(daily_df)
+        trades_df = signal_to_trades(daily_df, signal)
+        final_pnl = trades_df["pnl"].sum() if not trades_df.empty else 0.0
+        return pd.DataFrame(), trades_df, final_pnl
+
+    # VWAP micro and other bar-level strategies
     if volume_col is None:
         volume_col = "volume" if "volume" in df.columns else None
 
@@ -247,6 +344,7 @@ def run_backtest(
         trailing_stop_pts=strategy.trailing_stop_pts,
         long_only=strategy.long_only,
         volume_col=volume_col,
+        cooldown_after_loss_minutes=strategy.cooldown_after_loss_minutes,
         **strategy.params,
     )
 
@@ -1056,11 +1154,11 @@ def main():
                 console.print(f"[red]Unknown funded strategy: {args.funded_strategy}[/]")
                 console.print(f"Available: {', '.join(STRATEGIES.keys())}")
                 return
-            result = evaluate_combo(df, eval_strat, funded_strat, n_sims=args.sims)
+            result = evaluate_combo(df, eval_strat, funded_strat, n_eval_sims=args.sims)
             display_combo_detail(result)
         else:
             # All combos
-            combo_results = evaluate_all_combos(df, n_sims=args.sims)
+            combo_results = evaluate_all_combos(df, n_eval_sims=args.sims)
             display_combo_results(combo_results)
             console.print()
             if combo_results:
