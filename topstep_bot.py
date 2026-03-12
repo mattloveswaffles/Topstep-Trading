@@ -95,6 +95,7 @@ EVAL_CONFIG = {
     "day_bias_filter": False,           # no day bias — trade any day
     "trailing_stop_pts": 2.0,           # trail stop 2 pts behind best price
     "long_only": False,                 # trade both long and short
+    "max_daily_pnl": 1600.0,           # stop trading once daily PnL hits $1600
 }
 
 FUNDED_CONFIG = {
@@ -1446,6 +1447,11 @@ class TradingEngine:
         if acc.daily_pnl <= -DAILY_LOSS_LIMIT:
             if acc.position != 0:
                 self._close_position(acc, "daily_loss_cap")
+            return
+
+        # Daily profit cap — stop trading to protect gains
+        max_daily = EVAL_CONFIG.get("max_daily_pnl")
+        if max_daily and acc.daily_pnl >= max_daily:
             return
 
         # Max trades per day
