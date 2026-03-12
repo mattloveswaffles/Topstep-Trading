@@ -498,6 +498,7 @@ def run_topstep_nq(
     rsi_overbought_min: Optional[float] = 55.0,
     trailing_stop_pts: Optional[float] = None,
     cooldown_after_loss_minutes: Optional[int] = None,
+    max_daily_pnl: Optional[float] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
     Topstep-style NQ strategies with fixed-point brackets (stop_pts / target_pts).
@@ -644,8 +645,9 @@ def run_topstep_nq(
             effective_max_trades = min(effective_max_trades, 2) if effective_max_trades is not None else 2
         trades_ok = effective_max_trades is None or trades_today < effective_max_trades
         daily_stop_ok = daily_stop_loss is None or day_realized_pnl > -daily_stop_loss
+        daily_cap_ok = max_daily_pnl is None or day_realized_pnl < max_daily_pnl
         cooldown_ok = cooldown_until is None or ts >= cooldown_until
-        can_trade = trades_ok and daily_stop_ok and cooldown_ok
+        can_trade = trades_ok and daily_stop_ok and daily_cap_ok and cooldown_ok
 
         # Entry logic by strategy
         long_signal = False

@@ -91,6 +91,7 @@ class Strategy:
     long_only: bool = False
     alpha_fn: Optional[str] = None  # Alpha function name (e.g., "Alpha#44") for alpha strategies
     cooldown_after_loss_minutes: Optional[int] = None  # Minutes to wait after a losing trade
+    max_daily_pnl: Optional[float] = None  # Stop trading for the day once daily PnL hits this
 
 
 # ── Register your strategies here ────────────────────────────────────────
@@ -254,6 +255,80 @@ register_strategy(
     },
 )
 
+# ── 180-min cooldown + $1600 daily PnL cap variants ──────────────────────
+
+register_strategy(
+    name="vwap_mr_cd180_cap1600",
+    description="VWAP MR + 180min cooldown + $1600 daily cap",
+    strategy_type="vwap_micro",
+    stop_pts=5.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=15 * 60 + 45,
+    trailing_stop_pts=2.0,
+    long_only=False,
+    cooldown_after_loss_minutes=180,
+    max_daily_pnl=1600.0,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 1.5,
+        "min_down_bar_pts": 0.5,
+        "rsi_oversold_max": 50.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
+register_strategy(
+    name="vwap_mr_conservative_cd180_cap1600",
+    description="VWAP MR Conservative + 180min cooldown + $1600 cap",
+    strategy_type="vwap_micro",
+    stop_pts=5.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=12 * 60,
+    trailing_stop_pts=3.0,
+    long_only=True,
+    cooldown_after_loss_minutes=180,
+    max_daily_pnl=1600.0,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 2.0,
+        "min_down_bar_pts": 0.5,
+        "rsi_oversold_max": 40.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
+register_strategy(
+    name="vwap_mr_aggressive_cd180_cap1600",
+    description="VWAP MR Aggressive + 180min cooldown + $1600 cap",
+    strategy_type="vwap_micro",
+    stop_pts=5.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=15 * 60 + 45,
+    trailing_stop_pts=None,
+    long_only=False,
+    cooldown_after_loss_minutes=180,
+    max_daily_pnl=1600.0,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 1.0,
+        "min_down_bar_pts": 0.25,
+        "rsi_oversold_max": 50.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Data Loading
@@ -345,6 +420,7 @@ def run_backtest(
         long_only=strategy.long_only,
         volume_col=volume_col,
         cooldown_after_loss_minutes=strategy.cooldown_after_loss_minutes,
+        max_daily_pnl=strategy.max_daily_pnl,
         **strategy.params,
     )
 
@@ -455,6 +531,98 @@ def run_funded_mc(
         idx = rng.integers(0, len(daily_pnl), size=N)
         dpnl = daily_pnl[idx].copy()
         dpnl = np.maximum(dpnl, -FUNDED_DAILY_LOSS)
+
+        equity[alive] += dpnl[alive]
+        peak[alive] = np.maximum(peak[alive], equity[alive])
+        profit_since_payout[alive] += dpnl[alive]
+
+        winning_days[alive & (dpnl >= WINNING_DAY_THRESHOLD)] += 1
+
+        # Trailing DD bust
+        dd = peak - equity
+        busted = alive & (dd >= FUNDED_TRAILING_DD)
+        alive[busted] = False
+
+        # Payout check
+        can_pay = (
+            alive
+            & (winning_days >= WINNING_DAYS_REQUIRED)
+            & (profit_since_payout > 0)
+            & (equity > 0)
+        )
+        if can_pay.any():
+            payout_amt = np.minimum(PAYOUT_MAX, equity[can_pay] * PAYOUT_BAL_PCT)
+            payout_amt = np.maximum(payout_amt, 0)
+            total_extracted[can_pay] += payout_amt
+            equity[can_pay] -= payout_amt
+            payout_count[can_pay] += 1
+            winning_days[can_pay] = 0
+            profit_since_payout[can_pay] = 0.0
+            first_time = can_pay & (first_payout_day == -1)
+            first_payout_day[first_time] = day + 1
+
+    got_payout = payout_count > 0
+    pct = got_payout.sum() / N * 100
+
+    return {
+        "payout_pct": pct,
+        "avg_days_to_payout": float(first_payout_day[got_payout].mean()) if got_payout.any() else 0,
+        "avg_per_payout": float(total_extracted[got_payout].sum() / payout_count[got_payout].sum()) if got_payout.any() else 0,
+        "avg_total_extracted": float(total_extracted[got_payout].mean()) if got_payout.any() else 0,
+        "avg_payouts": float(payout_count[got_payout].mean()) if got_payout.any() else 0,
+        "funded_bust_rate": float((~alive).sum() / N * 100),
+    }
+
+
+def run_funded_mc_coast(
+    trades_df: pd.DataFrame,
+    coast_threshold: float = 2000.0,
+    coast_scale: float = 0.5,
+    coast_daily_cap: Optional[float] = None,
+    n_sims: int = FUNDED_SIMS,
+    max_days: int = FUNDED_MAX_DAYS,
+    seed: int = 42,
+) -> Dict:
+    """
+    Funded MC with coast mode: once profit_since_payout exceeds coast_threshold,
+    switch to safer trades (scaled PnL and/or capped daily PnL).
+
+    coast_scale: multiply PnL by this when coasting (0.5 = 1 contract instead of 2)
+    coast_daily_cap: if set, cap daily PnL at this value when coasting
+    """
+    if trades_df.empty:
+        return {
+            "payout_pct": 0, "avg_days_to_payout": 0, "avg_per_payout": 0,
+            "avg_total_extracted": 0, "avg_payouts": 0, "funded_bust_rate": 0,
+        }
+
+    daily_pnl = trades_df.groupby("trading_day")["pnl"].sum().values
+    rng = np.random.default_rng(seed)
+
+    N = n_sims
+    equity = np.zeros(N)
+    peak = np.zeros(N)
+    winning_days = np.zeros(N, dtype=int)
+    profit_since_payout = np.zeros(N)
+    total_extracted = np.zeros(N)
+    payout_count = np.zeros(N, dtype=int)
+    first_payout_day = np.full(N, -1, dtype=int)
+    alive = np.ones(N, dtype=bool)
+
+    for day in range(max_days):
+        if not alive.any():
+            break
+
+        idx = rng.integers(0, len(daily_pnl), size=N)
+        dpnl = daily_pnl[idx].copy().astype(float)
+        dpnl = np.maximum(dpnl, -FUNDED_DAILY_LOSS)
+
+        # Coast mode: scale down PnL for sims that exceeded threshold
+        coasting = alive & (profit_since_payout >= coast_threshold)
+        if coasting.any():
+            dpnl[coasting] *= coast_scale
+            if coast_daily_cap is not None:
+                dpnl[coasting] = np.clip(dpnl[coasting], -FUNDED_DAILY_LOSS * coast_scale, coast_daily_cap)
 
         equity[alive] += dpnl[alive]
         peak[alive] = np.maximum(peak[alive], equity[alive])
@@ -1092,6 +1260,7 @@ def main():
     parser.add_argument("--grid", action="store_true", help="Run grid search")
     parser.add_argument("--split", action="store_true", help="Run split test (IS/OOS)")
     parser.add_argument("--combo", action="store_true", help="Test all eval/funded strategy combinations")
+    parser.add_argument("--coast", action="store_true", help="Test funded coast mode variants")
     parser.add_argument("--eval-strategy", help="Eval strategy for combo mode")
     parser.add_argument("--funded-strategy", help="Funded strategy for combo mode")
     parser.add_argument("--sims", type=int, default=DEFAULT_SIMS, help="Number of MC sims")
@@ -1138,6 +1307,74 @@ def main():
 
         is_result, oos_result = split_test(df, STRATEGIES[strategy_name], n_sims=args.sims)
         display_split_comparison(is_result, oos_result)
+        return
+
+    # ── Coast Mode Test ───────────────────────────────────────────────
+    if args.coast:
+        strategy_name = args.strategy or "vwap_mr_cd180_cap1600"
+        if strategy_name not in STRATEGIES:
+            console.print(f"[red]Unknown strategy: {strategy_name}[/]")
+            return
+
+        console.print(f"[bold]Coast Mode Test — base strategy: {strategy_name}[/]\n")
+        strat = STRATEGIES[strategy_name]
+        _, trades_df, _ = run_backtest(df, strat)
+
+        if trades_df.empty:
+            console.print("[red]No trades generated[/]")
+            return
+
+        # Eval MC for full cycle EV calc
+        total_cal_days = df["datetime"].dt.date.nunique()
+        eval_mc = run_eval_mc(trades_df, total_calendar_days=total_cal_days, n_sims=args.sims)
+        pr = eval_mc["pass_rate"] / 100
+
+        # Define coast variants to test
+        coast_configs = [
+            {"label": "No coast (baseline)",        "threshold": 999999, "scale": 1.0,  "cap": None},
+            {"label": "Coast@$1500, 1 contract",    "threshold": 1500,   "scale": 0.5,  "cap": None},
+            {"label": "Coast@$1500, 1ct + $400 cap","threshold": 1500,   "scale": 0.5,  "cap": 400},
+            {"label": "Coast@$2000, 1 contract",    "threshold": 2000,   "scale": 0.5,  "cap": None},
+            {"label": "Coast@$2000, 1ct + $400 cap","threshold": 2000,   "scale": 0.5,  "cap": 400},
+            {"label": "Coast@$1000, 1 contract",    "threshold": 1000,   "scale": 0.5,  "cap": None},
+            {"label": "Coast@$1000, 1ct + $400 cap","threshold": 1000,   "scale": 0.5,  "cap": 400},
+            {"label": "Coast@$1500, 1ct + $200 cap","threshold": 1500,   "scale": 0.5,  "cap": 200},
+            {"label": "Coast@$2000, 1ct + $200 cap","threshold": 2000,   "scale": 0.5,  "cap": 200},
+        ]
+
+        best_ev = -float("inf")
+        best_label = ""
+        rows = []
+
+        for i, cfg in enumerate(coast_configs):
+            mc = run_funded_mc_coast(
+                trades_df,
+                coast_threshold=cfg["threshold"],
+                coast_scale=cfg["scale"],
+                coast_daily_cap=cfg["cap"],
+                n_sims=10000,
+            )
+            full_ev = pr * (mc["avg_total_extracted"] - ACTIVATION_FEE) - (1 - pr) * COMBINE_COST
+            if full_ev > best_ev:
+                best_ev = full_ev
+                best_label = cfg["label"]
+            rows.append((cfg["label"], mc, full_ev))
+
+        # Print as a clean list
+        console.print("[bold]Funded Coast Mode Comparison[/]\n")
+        console.print(f"  {'Config':<34} {'Pay%':>6} {'Days':>5} {'$/Pay':>8} {'#Pay':>5} {'Extracted':>11} {'Bust%':>7} {'Cycle EV':>10}")
+        console.print(f"  {'-'*34} {'-'*6} {'-'*5} {'-'*8} {'-'*5} {'-'*11} {'-'*7} {'-'*10}")
+        for label, mc, full_ev in rows:
+            ev_style = "[bold green]" if full_ev == best_ev else ""
+            ev_end = "[/]" if ev_style else ""
+            console.print(
+                f"  {label:<34} {mc['payout_pct']:>5.1f}% {mc['avg_days_to_payout']:>5.0f} "
+                f"${mc['avg_per_payout']:>6,.0f} {mc['avg_payouts']:>5.1f} "
+                f"${mc['avg_total_extracted']:>9,.0f} {mc['funded_bust_rate']:>6.1f}% "
+                f"{ev_style}${full_ev:>8,.0f}{ev_end}"
+            )
+
+        console.print(f"\n[bold green]Best: {best_label} (Full Cycle EV: ${best_ev:,.0f})[/]")
         return
 
     # ── Combo Test ────────────────────────────────────────────────────
