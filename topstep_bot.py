@@ -60,6 +60,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("topstep_bot")
 
+# Suppress noisy signalrcore reconnect warnings
+logging.getLogger("signalrcore").setLevel(logging.ERROR)
+
 
 class Phase(str, Enum):
     EVAL = "eval"
@@ -101,6 +104,12 @@ EVAL_CONFIG = {
 FUNDED_CONFIG = {
     "contracts": 2,
 }
+
+# Coast mode: once profit_since_payout exceeds threshold, reduce risk
+# to protect gains and grind out the 5 winning days for payout
+COAST_THRESHOLD = 1000.0       # switch to coast mode at $1000 profit since payout
+COAST_CONTRACTS = 1            # trade 1 contract instead of 2
+COAST_DAILY_CAP = 400.0        # stop trading for the day once up $400
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -549,7 +558,7 @@ class RealtimeClient:
         log.info(f"RT Market Hub subscribed: {len(self._contract_ids)} contract(s)")
 
     def _on_close(self):
-        log.warning("RT WebSocket closed - will auto-reconnect")
+        log.debug("RT WebSocket closed - will auto-reconnect")
 
     def _on_error(self, data):
         log.error(f"RT WebSocket error: {data}")
@@ -1092,12 +1101,14 @@ class TradingEngine:
             # This is an exit trade with realized PnL
             net = float(pnl) - fees
             acc.daily_pnl += net
+            acc.profit_since_payout += net
             acc.rt_trades_today.append(data)
             acc._pending_exit_cooldown = False
             log.info(
                 f"RT trade: acct {acc_id} | "
                 f"PnL=${float(pnl):+,.2f} fees=${fees:.2f} "
-                f"net=${net:+,.2f}"
+                f"net=${net:+,.2f} | "
+                f"profit_since_payout=${acc.profit_since_payout:+,.2f}"
             )
 
             # 180-minute cooldown after a losing trade
@@ -1449,10 +1460,18 @@ class TradingEngine:
                 self._close_position(acc, "daily_loss_cap")
             return
 
+        # Coast mode: reduce risk once profit_since_payout exceeds threshold
+        coasting = acc.profit_since_payout >= COAST_THRESHOLD
+
         # Daily profit cap — stop trading to protect gains
-        max_daily = EVAL_CONFIG.get("max_daily_pnl")
-        if max_daily and acc.daily_pnl >= max_daily:
-            return
+        # Use tighter cap when coasting
+        if coasting:
+            if acc.daily_pnl >= COAST_DAILY_CAP:
+                return
+        else:
+            max_daily = EVAL_CONFIG.get("max_daily_pnl")
+            if max_daily and acc.daily_pnl >= max_daily:
+                return
 
         # Max trades per day
         if acc.trades_today >= EVAL_CONFIG["max_trades_per_day"]:
@@ -1555,12 +1574,15 @@ class TradingEngine:
         # Local trailing stop (2pt) tightens it once price moves 3+ pts in our favor.
         stop_ticks = pts_to_ticks(EVAL_CONFIG["stop_pts"])
         target_ticks = pts_to_ticks(EVAL_CONFIG["target_pts"])
+        qty = COAST_CONTRACTS if coasting else EVAL_CONFIG["contracts"]
 
         if check_vwap_mr_entry(bars, EVAL_CONFIG, prev_day_close=prev_day_close):
+            if coasting:
+                log.info(f"COAST MODE: acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
             self._open_position(
                 acc,
                 side=OrderSide.BID,
-                contracts=EVAL_CONFIG["contracts"],
+                contracts=qty,
                 entry_price=current_price,
                 stop_pts=EVAL_CONFIG["stop_pts"],
                 target_pts=EVAL_CONFIG["target_pts"],
@@ -1569,10 +1591,12 @@ class TradingEngine:
             )
         elif (not EVAL_CONFIG.get("long_only", True)
               and check_vwap_mr_short_entry(bars, EVAL_CONFIG, prev_day_close=prev_day_close)):
+            if coasting:
+                log.info(f"COAST MODE: acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
             self._open_position(
                 acc,
                 side=OrderSide.ASK,
-                contracts=EVAL_CONFIG["contracts"],
+                contracts=qty,
                 entry_price=current_price,
                 stop_pts=EVAL_CONFIG["stop_pts"],
                 target_pts=EVAL_CONFIG["target_pts"],
@@ -1978,13 +2002,15 @@ class TradingEngine:
         self._refresh_daily_bars()
         last_daily_refresh = time.time()
         last_rest_sync = 0.0
+        last_dashboard_update = 0.0
         REST_SYNC_INTERVAL = 60  # REST fallback every 60s (vs 5s before)
 
         try:
-            with Live(self._build_dashboard(), console=console, refresh_per_second=1, vertical_overflow="crop") as live:
+            with Live(self._build_dashboard(), console=console, refresh_per_second=0.5, vertical_overflow="crop") as live:
                 while self.running:
                     try:
                         now = self._now_et()
+                        market_open = self._is_market_hours(now)
                         self._check_new_day()
 
                         # Refresh daily bars every 30 min
@@ -1995,7 +2021,7 @@ class TradingEngine:
                         # Re-auth if needed
                         self.api.ensure_auth()
 
-                        if self._is_market_hours(now):
+                        if market_open:
                             for acc in self.accounts.values():
                                 if not acc.active or not acc.can_trade:
                                     continue
@@ -2014,7 +2040,12 @@ class TradingEngine:
                                 self._sync_from_api(acc)
                             last_rest_sync = time.time()
 
-                        live.update(self._build_dashboard())
+                        # Update dashboard: every 5s during market, every 30s outside
+                        dash_interval = self.POLL_INTERVAL if market_open else 30
+                        if time.time() - last_dashboard_update >= dash_interval:
+                            live.update(self._build_dashboard())
+                            last_dashboard_update = time.time()
+
                         self._save_state()
                         time.sleep(self.POLL_INTERVAL)
 
