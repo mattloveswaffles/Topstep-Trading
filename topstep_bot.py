@@ -570,9 +570,9 @@ class RealtimeClient:
                 "type": 1,  # WebSocket transport
             }) \
             .with_automatic_reconnect({
-                "type": "raw",
+                "type": "interval",
                 "keep_alive_interval": 10,
-                "reconnect_interval": 5,
+                "intervals": [1, 2, 5, 10, 30, 60],
             }) \
             .build()
 
@@ -641,6 +641,7 @@ class AccountState:
     stop_order_id: Optional[int] = None   # exchange stop order ID for trail modification
     trades_today: int = 0
     cooldown_until: Optional[datetime] = None  # block entries after a loss for 180 min
+    last_exit_time: Optional[datetime] = None  # timestamp of last position close
 
     # VWAP MR state (eval)
     bars_5m: list = field(default_factory=list)
@@ -1061,10 +1062,16 @@ class TradingEngine:
         if new_size != acc.position:
             log.info(f"RT position change: acct {acc_id} | {acc.position} -> {new_size}")
 
+        was_in_position = acc.position != 0
         acc.position = new_size
         if avg_price is not None:
             acc.entry_price = float(avg_price)
         if new_size == 0:
+            # If we went from a position to flat via exchange (stop/target hit),
+            # block new entries until the RT trade event confirms PnL.
+            if was_in_position:
+                acc._pending_exit_cooldown = True
+                acc.last_exit_time = self._now_et()
             acc.entry_price = 0.0
             acc.stop_price = 0.0
             acc.target_price = 0.0
@@ -1085,7 +1092,12 @@ class TradingEngine:
             net = float(pnl) - fees
             acc.daily_pnl += net
             acc.rt_trades_today.append(data)
-            log.info(f"RT trade: acct {acc_id} | PnL=${float(pnl):+,.2f} fees=${fees:.2f} net=${net:+,.2f}")
+            acc._pending_exit_cooldown = False
+            log.info(
+                f"RT trade: acct {acc_id} | "
+                f"PnL=${float(pnl):+,.2f} fees=${fees:.2f} "
+                f"net=${net:+,.2f}"
+            )
 
             # 180-minute cooldown after a losing trade
             if net < 0:
@@ -1306,6 +1318,7 @@ class TradingEngine:
                 acc.entered_today = False
                 acc.rt_trades_today = []
                 acc.cooldown_until = None
+                acc.last_exit_time = None
                 # Reset day start balance for daily PnL tracking
                 if hasattr(acc, '_day_start_balance'):
                     del acc._day_start_balance
@@ -1438,6 +1451,17 @@ class TradingEngine:
         # Max trades per day
         if acc.trades_today >= EVAL_CONFIG["max_trades_per_day"]:
             return
+
+        # Block entries until RT trade event confirms PnL after exchange exit
+        if getattr(acc, '_pending_exit_cooldown', False):
+            return
+
+        # Hard minimum 30s gap after any exit — prevents race conditions
+        # where entry fires before WebSocket events arrive
+        if acc.last_exit_time is not None:
+            seconds_since_exit = (now - acc.last_exit_time).total_seconds()
+            if seconds_since_exit < 30:
+                return
 
         # 180-minute cooldown after a losing trade
         if acc.cooldown_until is not None and now < acc.cooldown_until:
@@ -1665,7 +1689,7 @@ class TradingEngine:
             acc.highest_price_since_entry = 0.0
             acc.target_price = 0.0
             acc.stop_order_id = None
-            # WebSocket will push PnL/equity/position updates automatically
+            acc.last_exit_time = self._now_et()
 
             # Check trailing DD bust
             drawdown = acc.peak - acc.equity
