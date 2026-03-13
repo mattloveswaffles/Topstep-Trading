@@ -88,10 +88,13 @@ class Strategy:
     session_tz: str = "America/New_York"
     max_trades_per_day: int = 5
     trailing_stop_pts: Optional[float] = 2.0
+    breakeven_stop_pts: Optional[float] = None
     long_only: bool = False
     alpha_fn: Optional[str] = None  # Alpha function name (e.g., "Alpha#44") for alpha strategies
     cooldown_after_loss_minutes: Optional[int] = None  # Minutes to wait after a losing trade
     max_daily_pnl: Optional[float] = None  # Stop trading for the day once daily PnL hits this
+    sessions: Optional[List[Tuple[int, int]]] = None  # Multi-session: list of (start_min, end_min)
+    session_day_start_min: Optional[int] = None  # Day boundary shift for overnight (e.g. 1080=6PM)
 
 
 # ── Register your strategies here ────────────────────────────────────────
@@ -130,129 +133,12 @@ register_strategy(
     },
 )
 
-# Conservative: tighter session, long only
-register_strategy(
-    name="vwap_mr_conservative",
-    description="VWAP MR — Morning session, long only, trail=3pt",
-    strategy_type="vwap_micro",
-    stop_pts=5.0,
-    target_pts=20.0,
-    contracts=2,
-    session_start_min=9 * 60 + 30,
-    session_end_min=12 * 60,  # morning only
-    trailing_stop_pts=3.0,
-    long_only=True,
-    params={
-        "vwap_micro_mean_reversion": True,
-        "high_prob_only": True,
-        "day_bias_filter": False,
-        "min_dip_pts": 2.0,
-        "min_down_bar_pts": 0.5,
-        "rsi_oversold_max": 40.0,
-        "rsi_overbought_min": 50.0,
-    },
-)
-
-# Aggressive: no trailing stop, wider dip
-register_strategy(
-    name="vwap_mr_aggressive",
-    description="VWAP MR — Full day, L+S, no trail, loose entry",
-    strategy_type="vwap_micro",
-    stop_pts=5.0,
-    target_pts=20.0,
-    contracts=2,
-    session_start_min=9 * 60 + 30,
-    session_end_min=15 * 60 + 45,
-    trailing_stop_pts=None,
-    long_only=False,
-    params={
-        "vwap_micro_mean_reversion": True,
-        "high_prob_only": True,
-        "day_bias_filter": False,
-        "min_dip_pts": 1.0,
-        "min_down_bar_pts": 0.25,
-        "rsi_oversold_max": 50.0,
-        "rsi_overbought_min": 50.0,
-    },
-)
-
 # Alpha#44: -correlation(high, rank(volume), 5) — daily signal strategy
 register_strategy(
     name="alpha44",
     description="Alpha#44 — daily signal, long when -corr(high, rank(vol), 5) > 0",
     strategy_type="alpha",
     alpha_fn="Alpha#44",
-)
-
-# ── 15-min cooldown after loss variants ──────────────────────────────────
-
-register_strategy(
-    name="vwap_mr_cd15",
-    description="VWAP MR + 15min cooldown after loss",
-    strategy_type="vwap_micro",
-    stop_pts=5.0,
-    target_pts=20.0,
-    contracts=2,
-    session_start_min=9 * 60 + 30,
-    session_end_min=15 * 60 + 45,
-    trailing_stop_pts=2.0,
-    long_only=False,
-    cooldown_after_loss_minutes=15,
-    params={
-        "vwap_micro_mean_reversion": True,
-        "high_prob_only": True,
-        "day_bias_filter": False,
-        "min_dip_pts": 1.5,
-        "min_down_bar_pts": 0.5,
-        "rsi_oversold_max": 50.0,
-        "rsi_overbought_min": 50.0,
-    },
-)
-
-register_strategy(
-    name="vwap_mr_conservative_cd15",
-    description="VWAP MR Conservative + 15min cooldown after loss",
-    strategy_type="vwap_micro",
-    stop_pts=5.0,
-    target_pts=20.0,
-    contracts=2,
-    session_start_min=9 * 60 + 30,
-    session_end_min=12 * 60,
-    trailing_stop_pts=3.0,
-    long_only=True,
-    cooldown_after_loss_minutes=15,
-    params={
-        "vwap_micro_mean_reversion": True,
-        "high_prob_only": True,
-        "day_bias_filter": False,
-        "min_dip_pts": 2.0,
-        "min_down_bar_pts": 0.5,
-        "rsi_oversold_max": 40.0,
-        "rsi_overbought_min": 50.0,
-    },
-)
-
-register_strategy(
-    name="vwap_mr_aggressive_cd15",
-    description="VWAP MR Aggressive + 15min cooldown after loss",
-    strategy_type="vwap_micro",
-    stop_pts=5.0,
-    target_pts=20.0,
-    contracts=2,
-    session_start_min=9 * 60 + 30,
-    session_end_min=15 * 60 + 45,
-    trailing_stop_pts=None,
-    long_only=False,
-    cooldown_after_loss_minutes=15,
-    params={
-        "vwap_micro_mean_reversion": True,
-        "high_prob_only": True,
-        "day_bias_filter": False,
-        "min_dip_pts": 1.0,
-        "min_down_bar_pts": 0.25,
-        "rsi_oversold_max": 50.0,
-        "rsi_overbought_min": 50.0,
-    },
 )
 
 # ── 180-min cooldown + $1600 daily PnL cap variants ──────────────────────
@@ -281,52 +167,103 @@ register_strategy(
     },
 )
 
+# ── Session definitions (ET) ─────────────────────────────────────────────
+# Asia:   6:00 PM - 2:00 AM ET (wraps midnight)
+# London: 3:00 AM - 9:30 AM ET
+# NY:     9:30 AM - 3:45 PM ET
+SESSION_ASIA   = (18 * 60, 2 * 60)          # 1080, 120
+SESSION_LONDON = (3 * 60, 9 * 60 + 30)      # 180, 570
+SESSION_NY     = (9 * 60 + 30, 15 * 60 + 45) # 570, 945
+
+# Topstep day starts at Asia open (6PM ET) — trade caps shared across sessions
+TOPSTEP_DAY_START = 18 * 60  # 1080 minutes = 6:00 PM ET
+
+_MR_PARAMS = {
+    "vwap_micro_mean_reversion": True,
+    "high_prob_only": True,
+    "day_bias_filter": False,
+    "min_dip_pts": 1.5,
+    "min_down_bar_pts": 0.5,
+    "rsi_oversold_max": 50.0,
+    "rsi_overbought_min": 50.0,
+}
+
+# Asia only
 register_strategy(
-    name="vwap_mr_conservative_cd180_cap1600",
-    description="VWAP MR Conservative + 180min cooldown + $1600 cap",
+    name="vwap_mr_asia",
+    description="VWAP MR — Asia (6PM-2AM ET), shared day cap",
     strategy_type="vwap_micro",
-    stop_pts=5.0,
-    target_pts=20.0,
-    contracts=2,
-    session_start_min=9 * 60 + 30,
-    session_end_min=12 * 60,
-    trailing_stop_pts=3.0,
-    long_only=True,
-    cooldown_after_loss_minutes=180,
-    max_daily_pnl=1600.0,
-    params={
-        "vwap_micro_mean_reversion": True,
-        "high_prob_only": True,
-        "day_bias_filter": False,
-        "min_dip_pts": 2.0,
-        "min_down_bar_pts": 0.5,
-        "rsi_oversold_max": 40.0,
-        "rsi_overbought_min": 50.0,
-    },
+    stop_pts=5.0, target_pts=20.0, contracts=2,
+    sessions=[SESSION_ASIA],
+    session_day_start_min=TOPSTEP_DAY_START,
+    trailing_stop_pts=2.0, long_only=False,
+    cooldown_after_loss_minutes=180, max_daily_pnl=1600.0,
+    params=_MR_PARAMS,
 )
 
+# London only
 register_strategy(
-    name="vwap_mr_aggressive_cd180_cap1600",
-    description="VWAP MR Aggressive + 180min cooldown + $1600 cap",
+    name="vwap_mr_london",
+    description="VWAP MR — London (3AM-9:30AM ET), shared day cap",
     strategy_type="vwap_micro",
-    stop_pts=5.0,
-    target_pts=20.0,
-    contracts=2,
-    session_start_min=9 * 60 + 30,
-    session_end_min=15 * 60 + 45,
-    trailing_stop_pts=None,
-    long_only=False,
-    cooldown_after_loss_minutes=180,
-    max_daily_pnl=1600.0,
-    params={
-        "vwap_micro_mean_reversion": True,
-        "high_prob_only": True,
-        "day_bias_filter": False,
-        "min_dip_pts": 1.0,
-        "min_down_bar_pts": 0.25,
-        "rsi_oversold_max": 50.0,
-        "rsi_overbought_min": 50.0,
-    },
+    stop_pts=5.0, target_pts=20.0, contracts=2,
+    sessions=[SESSION_LONDON],
+    session_day_start_min=TOPSTEP_DAY_START,
+    trailing_stop_pts=2.0, long_only=False,
+    cooldown_after_loss_minutes=180, max_daily_pnl=1600.0,
+    params=_MR_PARAMS,
+)
+
+# Asia + London
+register_strategy(
+    name="vwap_mr_asia_london",
+    description="VWAP MR — Asia+London (6PM-9:30AM ET), shared day cap",
+    strategy_type="vwap_micro",
+    stop_pts=5.0, target_pts=20.0, contracts=2,
+    sessions=[SESSION_ASIA, SESSION_LONDON],
+    session_day_start_min=TOPSTEP_DAY_START,
+    trailing_stop_pts=2.0, long_only=False,
+    cooldown_after_loss_minutes=180, max_daily_pnl=1600.0,
+    params=_MR_PARAMS,
+)
+
+# Asia + NY
+register_strategy(
+    name="vwap_mr_asia_ny",
+    description="VWAP MR — Asia+NY, shared day cap",
+    strategy_type="vwap_micro",
+    stop_pts=5.0, target_pts=20.0, contracts=2,
+    sessions=[SESSION_ASIA, SESSION_NY],
+    session_day_start_min=TOPSTEP_DAY_START,
+    trailing_stop_pts=2.0, long_only=False,
+    cooldown_after_loss_minutes=180, max_daily_pnl=1600.0,
+    params=_MR_PARAMS,
+)
+
+# London + NY
+register_strategy(
+    name="vwap_mr_london_ny",
+    description="VWAP MR — London+NY (3AM-3:45PM ET), shared day cap",
+    strategy_type="vwap_micro",
+    stop_pts=5.0, target_pts=20.0, contracts=2,
+    sessions=[SESSION_LONDON, SESSION_NY],
+    session_day_start_min=TOPSTEP_DAY_START,
+    trailing_stop_pts=2.0, long_only=False,
+    cooldown_after_loss_minutes=180, max_daily_pnl=1600.0,
+    params=_MR_PARAMS,
+)
+
+# All sessions: Asia + London + NY (full Topstep day)
+register_strategy(
+    name="vwap_mr_all_sessions",
+    description="VWAP MR — Asia+London+NY, shared 5-trade day cap",
+    strategy_type="vwap_micro",
+    stop_pts=5.0, target_pts=20.0, contracts=2,
+    sessions=[SESSION_ASIA, SESSION_LONDON, SESSION_NY],
+    session_day_start_min=TOPSTEP_DAY_START,
+    trailing_stop_pts=2.0, long_only=False,
+    cooldown_after_loss_minutes=180, max_daily_pnl=1600.0,
+    params=_MR_PARAMS,
 )
 
 
@@ -442,11 +379,14 @@ def run_backtest(
         session_tz=strategy.session_tz,
         max_trades_per_day=strategy.max_trades_per_day,
         trailing_stop_pts=strategy.trailing_stop_pts,
+        breakeven_stop_pts=strategy.breakeven_stop_pts,
         long_only=strategy.long_only,
         volume_col=volume_col,
         cooldown_after_loss_minutes=strategy.cooldown_after_loss_minutes,
         max_daily_pnl=strategy.max_daily_pnl,
         df_1m=df_1m,
+        sessions=strategy.sessions,
+        session_day_start_min=strategy.session_day_start_min,
         **strategy.params,
     )
 
@@ -490,6 +430,7 @@ def compute_trade_stats(trades_df: pd.DataFrame) -> Dict:
 def run_eval_mc(
     trades_df: pd.DataFrame,
     total_calendar_days: int = 0,
+    total_data_days: int = 0,
     n_sims: int = DEFAULT_SIMS,
 ) -> Dict:
     """Run Monte Carlo eval simulation. Returns key metrics as dict."""
@@ -503,6 +444,7 @@ def run_eval_mc(
         trades_df,
         n_simulations=n_sims,
         total_calendar_days=total_calendar_days,
+        total_data_days=total_data_days,
     )
 
     passed = attempts_df[attempts_df["Result"] == "PASS"]
@@ -717,12 +659,18 @@ def evaluate_strategy(
     # Trade stats
     stats = compute_trade_stats(trades_df)
 
-    # Calendar days for flat day modeling
-    # Use unique dates with data (not full calendar span — matches combo_vwap_alpha.py)
-    total_cal_days = df["datetime"].dt.date.nunique()
+    # Calendar days: full span including weekends/holidays
+    min_date = df["datetime"].dt.date.min()
+    max_date = df["datetime"].dt.date.max()
+    total_cal_days = (max_date - min_date).days + 1
+    # Data days: days with actual market data (excludes weekends/holidays)
+    total_data_days = df["datetime"].dt.date.nunique()
 
     # Eval MC
-    eval_mc = run_eval_mc(trades_df, total_calendar_days=total_cal_days, n_sims=n_eval_sims)
+    eval_mc = run_eval_mc(
+        trades_df, total_calendar_days=total_cal_days,
+        total_data_days=total_data_days, n_sims=n_eval_sims,
+    )
 
     # Funded MC
     funded_mc = run_funded_mc(trades_df, n_sims=n_funded_sims)
@@ -830,8 +778,14 @@ def evaluate_combo(
         return ComboResult(eval_strategy=eval_strategy.name, funded_strategy=funded_strategy.name)
 
     eval_stats = compute_trade_stats(eval_trades_df)
-    total_cal_days = df["datetime"].dt.date.nunique()
-    eval_mc = run_eval_mc(eval_trades_df, total_calendar_days=total_cal_days, n_sims=n_eval_sims)
+    min_date = df["datetime"].dt.date.min()
+    max_date = df["datetime"].dt.date.max()
+    total_cal_days = (max_date - min_date).days + 1
+    total_data_days = df["datetime"].dt.date.nunique()
+    eval_mc = run_eval_mc(
+        eval_trades_df, total_calendar_days=total_cal_days,
+        total_data_days=total_data_days, n_sims=n_eval_sims,
+    )
 
     # Run funded backtest (separate strategy)
     _, funded_trades_df, _ = run_backtest(df, funded_strategy, df_1m=df_1m)
@@ -1014,8 +968,10 @@ def grid_search(
     console.print(f"\n[bold]Grid Search:[/] {len(combos)} combinations")
     console.print(f"  Params: {keys}")
 
-    # Use unique dates with data (not full calendar span — matches combo_vwap_alpha.py)
-    total_cal_days = df["datetime"].dt.date.nunique()
+    min_date = df["datetime"].dt.date.min()
+    max_date = df["datetime"].dt.date.max()
+    total_cal_days = (max_date - min_date).days + 1
+    total_data_days = df["datetime"].dt.date.nunique()
 
     volume_col = "volume" if "volume" in df.columns else None
     results = []
@@ -1058,7 +1014,10 @@ def grid_search(
             continue
 
         stats = compute_trade_stats(trades_df)
-        eval_mc = run_eval_mc(trades_df, total_calendar_days=total_cal_days, n_sims=n_sims)
+        eval_mc = run_eval_mc(
+            trades_df, total_calendar_days=total_cal_days,
+            total_data_days=total_data_days, n_sims=n_sims,
+        )
         funded_mc = run_funded_mc(trades_df, n_sims=min(n_sims, 5000))
 
         pr = eval_mc["pass_rate"] / 100
@@ -1362,8 +1321,14 @@ def main():
             return
 
         # Eval MC for full cycle EV calc
-        total_cal_days = df["datetime"].dt.date.nunique()
-        eval_mc = run_eval_mc(trades_df, total_calendar_days=total_cal_days, n_sims=args.sims)
+        min_date = df["datetime"].dt.date.min()
+        max_date = df["datetime"].dt.date.max()
+        total_cal_days = (max_date - min_date).days + 1
+        total_data_days = df["datetime"].dt.date.nunique()
+        eval_mc = run_eval_mc(
+            trades_df, total_calendar_days=total_cal_days,
+            total_data_days=total_data_days, n_sims=args.sims,
+        )
         pr = eval_mc["pass_rate"] / 100
 
         # Define coast variants to test

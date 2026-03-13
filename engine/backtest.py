@@ -68,11 +68,15 @@ def _session_mask(
     start_minutes: int,
     end_minutes: int,
     session_tz: Optional[str] = None,
+    sessions: Optional[List[Tuple[int, int]]] = None,
 ) -> pd.Series:
     """
     True where time (in minutes from midnight) is in [start_minutes, end_minutes].
     If session_tz is set (e.g. 'America/New_York') and dt is timezone-aware, times are
     converted to that zone first so start/end are in local session (e.g. RTH 9:30-15:45 ET).
+
+    If `sessions` is provided (list of (start_min, end_min) tuples), returns the union
+    of all session windows. `start_minutes`/`end_minutes` are ignored in that case.
     """
     if session_tz and hasattr(dt.dt, "tz") and dt.dt.tz is not None:
         try:
@@ -80,7 +84,22 @@ def _session_mask(
         except Exception:
             pass
     minutes = dt.dt.hour * 60 + dt.dt.minute
-    return (minutes >= start_minutes) & (minutes <= end_minutes)
+
+    if sessions is not None:
+        mask = pd.Series(False, index=dt.index)
+        for s_start, s_end in sessions:
+            if s_start <= s_end:
+                mask = mask | ((minutes >= s_start) & (minutes <= s_end))
+            else:
+                # Overnight wrap
+                mask = mask | ((minutes >= s_start) | (minutes <= s_end))
+        return mask
+
+    if start_minutes <= end_minutes:
+        return (minutes >= start_minutes) & (minutes <= end_minutes)
+    else:
+        # Overnight session (e.g. 18:00 - 02:00): wraps midnight
+        return (minutes >= start_minutes) | (minutes <= end_minutes)
 
 
 def _vwap_std_per_day(
@@ -497,15 +516,23 @@ def run_topstep_nq(
     long_only: bool = True,
     rsi_overbought_min: Optional[float] = 55.0,
     trailing_stop_pts: Optional[float] = None,
+    breakeven_stop_pts: Optional[float] = None,
     cooldown_after_loss_minutes: Optional[int] = None,
     max_daily_pnl: Optional[float] = None,
     df_1m: Optional[pd.DataFrame] = None,
+    sessions: Optional[List[Tuple[int, int]]] = None,
+    session_day_start_min: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
     Topstep-style NQ strategies with fixed-point brackets (stop_pts / target_pts).
     high_prob_only: for mean reversion, require deeper dip, clear down bar, optional RSI oversold; cap 3 t/day.
     long_only=True: only take long trades. Set False to also take shorts (mirror MR logic).
     Session filter and optional max_trades_per_day for consistency rule.
+
+    sessions: list of (start_min, end_min) tuples for multiple session windows.
+              Trade caps and daily PnL limits are shared across all sessions within a day.
+    session_day_start_min: minute-of-day when a new "session day" starts (e.g. 1080 = 6PM ET
+              for overnight sessions). Shifts trading_day so Asia→London→NY share one day.
 
     strategy:
       - "vwap_micro": close > VWAP and close > prev_close. High frequency, 3/12 pts typical. ~82% pass in 7-8 days.
@@ -563,8 +590,19 @@ def run_topstep_nq(
         df["_htf_ema"] = np.nan
         df["_htf_ema_prev"] = np.nan
     df["_session"] = _session_mask(
-        df[timestamp_col], session_start_min, session_end_min, session_tz=session_tz
+        df[timestamp_col], session_start_min, session_end_min, session_tz=session_tz,
+        sessions=sessions,
     )
+    # Shift trading_day boundary for overnight multi-session (e.g. 6PM start)
+    if session_day_start_min is not None:
+        local_dt = pd.to_datetime(df[timestamp_col])
+        if session_tz and hasattr(local_dt.dt, "tz") and local_dt.dt.tz is not None:
+            try:
+                local_dt = local_dt.dt.tz_convert(session_tz)
+            except Exception:
+                pass
+        shifted = local_dt - pd.Timedelta(minutes=session_day_start_min)
+        df["trading_day"] = shifted.dt.date.astype(str)
     df["_prev_close"] = close.shift(1)
     df["_prev_high"] = high.shift(1)
 
@@ -906,12 +944,13 @@ def run_topstep_nq(
                         break
 
                     # Ratchet trailing stop after each 1m bar
+                    highest_price_since_entry = max(highest_price_since_entry or bh, bh)
+                    if breakeven_stop_pts is not None:
+                        if highest_price_since_entry - entry_price >= breakeven_stop_pts:
+                            stop_level = max(stop_level, entry_price)
                     if trailing_stop_pts is not None:
-                        highest_price_since_entry = max(highest_price_since_entry or bh, bh)
                         trail_stop = highest_price_since_entry - trailing_stop_pts
                         stop_level = max(stop_level, trail_stop)
-                    else:
-                        highest_price_since_entry = max(highest_price_since_entry or bh, bh)
 
                 elif is_short:
                     # PESSIMISTIC: check stop first
@@ -961,12 +1000,13 @@ def run_topstep_nq(
                         break
 
                     # Ratchet trailing stop after each 1m bar
+                    highest_price_since_entry = min(highest_price_since_entry or bl, bl)
+                    if breakeven_stop_pts is not None:
+                        if entry_price - highest_price_since_entry >= breakeven_stop_pts:
+                            stop_level = min(stop_level, entry_price)
                     if trailing_stop_pts is not None:
-                        highest_price_since_entry = min(highest_price_since_entry or bl, bl)
                         trail_stop = highest_price_since_entry + trailing_stop_pts
                         stop_level = min(stop_level, trail_stop)
-                    else:
-                        highest_price_since_entry = min(highest_price_since_entry or bl, bl)
 
             if not exit_now:
                 last_bar = (k + 1 >= n) or (df.iloc[k + 1]["trading_day"] != day)
@@ -1369,6 +1409,7 @@ def monte_carlo_topstep(
     random_seed: int = 42,
     day1_profit_cap: float = 1400.0,
     total_calendar_days: int = 0,
+    total_data_days: int = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Numba-JIT Monte Carlo simulation of Topstep Combine attempts.
@@ -1380,9 +1421,12 @@ def monte_carlo_topstep(
         bust if max(gap - min_cum, intra_dd) > TRAILING_DRAWDOWN
     where gap = peak - equity at start of day.
 
-    If total_calendar_days > 0, FLAT (no-trade) days are modeled:
-    each sim step is one calendar day, with a flat_ratio chance of being
-    a no-trade day (PnL=0, calendar day still passes).
+    Calendar/trading day modeling:
+      - total_calendar_days: full calendar span (includes weekends/holidays)
+      - total_data_days: days with market data (excludes weekends/holidays)
+      - flat_ratio: probability a day is market-closed (only burns calendar day)
+      - Days with data but no trades are added as $0 PnL entries in the pool,
+        so they count as trading days (we were active, just no signal).
     """
     required_cols = ["timestamp", "pnl", "trading_day"]
     missing = [c for c in required_cols if c not in trades.columns]
@@ -1392,10 +1436,24 @@ def monte_carlo_topstep(
     trades = trades.sort_values(["trading_day", "timestamp"])
     grouped = list(trades.groupby("trading_day"))
     day_trades = [g[1].reset_index(drop=True) for g in grouped]
+    n_trade_days = len(day_trades)
+
+    # Add zero-PnL entries for data days without trades (active but no signal).
+    # These count as trading days in the sim — we showed up, just didn't trade.
+    if total_data_days > 0:
+        n_no_signal_days = max(0, total_data_days - n_trade_days)
+    else:
+        n_no_signal_days = 0
+    for _ in range(n_no_signal_days):
+        day_trades.append(pd.DataFrame({"pnl": [0.0]}))
     n_days = len(day_trades)
 
-    # Compute flat day ratio
-    if total_calendar_days > 0 and total_calendar_days > n_days:
+    # Flat ratio = only market-closed days (weekends/holidays)
+    # These burn a calendar day but do NOT count as a trading day.
+    if total_calendar_days > 0 and total_calendar_days > total_data_days:
+        flat_ratio = 1.0 - (max(total_data_days, n_trade_days) / total_calendar_days)
+    elif total_calendar_days > 0 and total_calendar_days > n_days:
+        # Fallback: old behavior if total_data_days not provided
         flat_ratio = 1.0 - (n_days / total_calendar_days)
     else:
         flat_ratio = 0.0
