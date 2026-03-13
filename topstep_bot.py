@@ -61,7 +61,17 @@ logging.basicConfig(
 log = logging.getLogger("topstep_bot")
 
 # Suppress noisy signalrcore reconnect warnings
-logging.getLogger("signalrcore").setLevel(logging.ERROR)
+for _logger_name in ("signalrcore", "signalrcore.hub", "signalrcore.transport",
+                      "websocket", "websockets"):
+    logging.getLogger(_logger_name).setLevel(logging.CRITICAL)
+
+# Filter out "Connection closed" spam from signalrcore hitting root logger
+class _SignalRFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return "Connection closed" not in msg and "Handshake" not in msg
+for _h in logging.root.handlers:
+    _h.addFilter(_SignalRFilter())
 
 
 class Phase(str, Enum):
@@ -964,6 +974,15 @@ class TradingEngine:
         self._last_quote: Dict = {}       # latest market quote from WebSocket
         self._rt_connected = False
 
+        # Activity log for dashboard (rolling last 20 events)
+        from collections import deque
+        self._activity_log: deque = deque(maxlen=20)
+
+    def _log_activity(self, msg: str, style: str = ""):
+        """Add an event to the dashboard activity log."""
+        ts = self._now_et().strftime("%H:%M:%S")
+        self._activity_log.append((ts, msg, style))
+
     # ── Setup ─────────────────────────────────────────────────────────
 
     def setup(self):
@@ -1110,11 +1129,14 @@ class TradingEngine:
                 f"net=${net:+,.2f} | "
                 f"profit_since_payout=${acc.profit_since_payout:+,.2f}"
             )
+            pnl_style = "green" if net >= 0 else "red"
+            self._log_activity(f"Trade closed: ${net:+,.2f} (day: ${acc.daily_pnl:+,.2f})", pnl_style)
 
             # 180-minute cooldown after a losing trade
             if net < 0:
                 acc.cooldown_until = self._now_et() + timedelta(minutes=180)
                 log.info(f"Loss cooldown: acct {acc_id} | no entries until {acc.cooldown_until.strftime('%H:%M')}")
+                self._log_activity(f"Cooldown until {acc.cooldown_until.strftime('%H:%M')} (180min)", "yellow")
 
             # Update trade count
             acc.trades_today = len([
@@ -1261,8 +1283,26 @@ class TradingEngine:
                     if acc.position == 0 and size != 0:
                         log.warning(
                             f"API sync: detected position {size} "
-                            f"but bot thinks flat"
+                            f"but bot thinks flat — recovering bracket orders"
                         )
+                        # Recover stop order ID so trailing logic works
+                        try:
+                            orders = self.api.get_open_orders(acc.account_id)
+                            for o in orders:
+                                if o.get("type") in (OrderType.STOP, OrderType.TRAILING_STOP):
+                                    acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
+                                    stop_px = o.get("stopPrice") or o.get("price")
+                                    if stop_px:
+                                        acc.stop_price = float(stop_px)
+                                    log.info(f"Recovered stop order {acc.stop_order_id} @ {acc.stop_price}")
+                                    break
+                            avg_px = nq_pos.get("averagePrice")
+                            if avg_px:
+                                acc.entry_price = float(avg_px)
+                                acc.highest_price_since_entry = acc.entry_price
+                        except Exception as e:
+                            log.error(f"Failed to recover bracket orders: {e}")
+                        self._log_activity(f"Recovered position: {size}x @ {acc.entry_price:.2f}", "yellow")
                     acc.position = size
                 else:
                     if acc.position != 0:
@@ -1536,6 +1576,7 @@ class TradingEngine:
                         f"Trail stop moved on exchange: order {acc.stop_order_id} "
                         f"-> {new_stop:.2f} (high={acc.highest_price_since_entry:.2f})"
                     )
+                    self._log_activity(f"Stop moved -> {new_stop:.2f} (best: {acc.highest_price_since_entry:.2f})", "cyan")
                 except Exception as e:
                     log.error(f"Failed to modify stop order: {e}")
             elif new_stop is not None and acc.stop_order_id is None:
@@ -1686,9 +1727,13 @@ class TradingEngine:
                 f"OPENED: Acct {acc.account_id} | {side_str} {contracts}x NQ @ ~{entry_price:.2f} | "
                 f"SL={acc.stop_price:.2f} TP={acc.target_price:.2f}{trail_str}"
             )
-            # WebSocket will push position/account updates automatically
+            self._log_activity(
+                f"ENTRY: {side_str} {contracts}x @ {entry_price:.2f} | SL={acc.stop_price:.2f} TP={acc.target_price:.2f}",
+                "green" if side == OrderSide.BID else "red"
+            )
         except Exception as e:
             log.error(f"Order failed on acct {acc.account_id}: {e}")
+            self._log_activity(f"Order FAILED: {e}", "red")
             acc.last_error = str(e)
 
     def _close_position(self, acc: AccountState, reason: str):
@@ -1712,6 +1757,7 @@ class TradingEngine:
                 f"CLOSED: Acct {acc.account_id} | {reason} | "
                 f"{side_str} {contracts}x NQ"
             )
+            self._log_activity(f"Position closed: {reason} ({side_str} {contracts}x)", "yellow")
 
             acc.position = 0
             acc.entry_price = 0.0
@@ -1990,6 +2036,21 @@ class TradingEngine:
                 outer.add_row(trade_table)
             break  # only first account
 
+        # Activity log panel
+        if self._activity_log:
+            outer.add_row(Text(""))
+            log_table = Table(
+                show_lines=False, expand=True,
+                title="Activity Log",
+                title_style="bold cyan",
+                show_header=False,
+            )
+            log_table.add_column("Time", width=10, style="dim")
+            log_table.add_column("Event", ratio=1)
+            for ts, msg, style in reversed(self._activity_log):
+                log_table.add_row(ts, f"[{style}]{msg}[/]" if style else msg)
+            outer.add_row(log_table)
+
         return outer
 
     # ── Main Loop ─────────────────────────────────────────────────────
@@ -2056,13 +2117,26 @@ class TradingEngine:
                         time.sleep(60)
 
         except KeyboardInterrupt:
-            log.info("Shutting down — closing all positions...")
+            log.info("Shutting down...")
             if self._rt:
                 self._rt.stop()
             for acc in self.accounts.values():
                 if acc.position != 0:
-                    log.info(f"Closing position on acct {acc.account_id}")
-                    self._close_position(acc, "shutdown")
+                    # Check if bracket orders (SL/TP) are on the exchange
+                    has_brackets = False
+                    try:
+                        orders = self.api.get_open_orders(acc.account_id)
+                        stop_orders = [o for o in orders if o.get("type") in (OrderType.STOP, OrderType.TRAILING_STOP)]
+                        has_brackets = len(stop_orders) > 0
+                    except Exception:
+                        pass
+                    if has_brackets:
+                        log.info(
+                            f"Acct {acc.account_id}: position open with bracket orders on exchange — leaving as-is"
+                        )
+                    else:
+                        log.info(f"Acct {acc.account_id}: no brackets found — closing position")
+                        self._close_position(acc, "shutdown")
             self._save_state()
             log.info("Bot stopped.")
 
