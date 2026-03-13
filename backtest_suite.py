@@ -52,7 +52,7 @@ console = Console()
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════
 
-DATA_PATH = "data/nq_5m_stitched.parquet"
+DATA_PATH = "data/nq_1m.parquet"
 DEFAULT_SIMS = 50_000
 FUNDED_SIMS = 10_000
 FUNDED_MAX_DAYS = 500
@@ -334,14 +334,37 @@ register_strategy(
 # Data Loading
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_data(path: str = DATA_PATH) -> pd.DataFrame:
-    """Load and prepare NQ 5m OHLCV data."""
+def load_data(path: str = DATA_PATH) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """Load NQ OHLCV data. Returns (df_5m, df_1m).
+
+    If source is 1m data, returns both 5m (for signals) and 1m (for stop management).
+    If source is already 5m, returns (df_5m, None).
+    """
     df = pd.read_parquet(path)
     if isinstance(df.index, pd.DatetimeIndex):
         df = df.reset_index(names=["datetime"])
     if "datetime" in df.columns and df["datetime"].dt.tz is None:
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    return df.sort_values("datetime")
+    df = df.sort_values("datetime")
+
+    df_1m = None
+    # Detect 1-min data and resample to 5-min
+    if len(df) > 1000:
+        sample_diff = (df["datetime"].iloc[10] - df["datetime"].iloc[9]).total_seconds()
+        if sample_diff < 120:  # 1-min data
+            df_1m = df.copy()
+            print("  Resampling 1m -> 5m...", end=" ", flush=True)
+            df = df.set_index("datetime")
+            df = df.resample("5min").agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }).dropna().reset_index()
+            print(f"{len(df):,} bars")
+
+    return df, df_1m
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -365,6 +388,7 @@ class BacktestResult:
     profit_factor: float = 0.0
     max_drawdown: float = 0.0
     sharpe: float = 0.0
+    avg_duration_min: float = 0.0
     # MC results
     pass_rate: float = 0.0
     avg_cal_days: float = 0.0
@@ -387,6 +411,7 @@ def run_backtest(
     strategy: Strategy,
     volume_col: Optional[str] = None,
     daily_df: Optional[pd.DataFrame] = None,
+    df_1m: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """Run a strategy backtest, returning (bar_df, trades_df, final_pnl)."""
 
@@ -421,6 +446,7 @@ def run_backtest(
         volume_col=volume_col,
         cooldown_after_loss_minutes=strategy.cooldown_after_loss_minutes,
         max_daily_pnl=strategy.max_daily_pnl,
+        df_1m=df_1m,
         **strategy.params,
     )
 
@@ -453,6 +479,7 @@ def compute_trade_stats(trades_df: pd.DataFrame) -> Dict:
         "profit_factor": wins.sum() / abs(losses.sum()) if losses.sum() != 0 else 999,
         "max_drawdown": (pnl.cumsum() - pnl.cumsum().cummax()).min(),
         "sharpe": daily_pnl.mean() / daily_pnl.std() * (252 ** 0.5) if daily_pnl.std() > 0 else 0,
+        "avg_duration_min": trades_df["duration_min"].mean() if "duration_min" in trades_df.columns else 0,
     }
 
 
@@ -675,12 +702,13 @@ def evaluate_strategy(
     strategy: Strategy,
     n_eval_sims: int = DEFAULT_SIMS,
     n_funded_sims: int = FUNDED_SIMS,
+    df_1m: Optional[pd.DataFrame] = None,
 ) -> BacktestResult:
     """Full evaluation: backtest to trade stats to eval MC to funded MC to EV."""
     t0 = time.time()
 
     # Run backtest
-    _, trades_df, _ = run_backtest(df, strategy)
+    _, trades_df, _ = run_backtest(df, strategy, df_1m=df_1m)
 
     if trades_df.empty:
         console.print(f"  [red]{strategy.name}: no trades generated[/]")
@@ -721,6 +749,7 @@ def evaluate_strategy(
         profit_factor=stats["profit_factor"],
         max_drawdown=stats["max_drawdown"],
         sharpe=stats["sharpe"],
+        avg_duration_min=stats["avg_duration_min"],
         # Eval MC
         pass_rate=eval_mc["pass_rate"],
         avg_cal_days=eval_mc["avg_cal_days"],
@@ -781,6 +810,7 @@ def evaluate_combo(
     funded_strategy: Strategy,
     n_eval_sims: int = DEFAULT_SIMS,
     n_funded_sims: int = FUNDED_SIMS,
+    df_1m: Optional[pd.DataFrame] = None,
 ) -> ComboResult:
     """
     Evaluate a combo: one strategy for passing eval, another for funded payouts.
@@ -794,7 +824,7 @@ def evaluate_combo(
     console.print(f"  Funded strategy: [cyan]{funded_strategy.name}[/]")
 
     # Run eval backtest
-    _, eval_trades_df, _ = run_backtest(df, eval_strategy)
+    _, eval_trades_df, _ = run_backtest(df, eval_strategy, df_1m=df_1m)
     if eval_trades_df.empty:
         console.print(f"  [red]Eval strategy produced no trades[/]")
         return ComboResult(eval_strategy=eval_strategy.name, funded_strategy=funded_strategy.name)
@@ -804,7 +834,7 @@ def evaluate_combo(
     eval_mc = run_eval_mc(eval_trades_df, total_calendar_days=total_cal_days, n_sims=n_eval_sims)
 
     # Run funded backtest (separate strategy)
-    _, funded_trades_df, _ = run_backtest(df, funded_strategy)
+    _, funded_trades_df, _ = run_backtest(df, funded_strategy, df_1m=df_1m)
     if funded_trades_df.empty:
         console.print(f"  [red]Funded strategy produced no trades[/]")
         return ComboResult(eval_strategy=eval_strategy.name, funded_strategy=funded_strategy.name)
@@ -849,6 +879,7 @@ def evaluate_all_combos(
     df: pd.DataFrame,
     n_eval_sims: int = DEFAULT_SIMS,
     n_funded_sims: int = FUNDED_SIMS,
+    df_1m: Optional[pd.DataFrame] = None,
 ) -> List[ComboResult]:
     """Test every eval/funded strategy combination and rank by full cycle EV."""
     strategy_names = list(STRATEGIES.keys())
@@ -866,6 +897,7 @@ def evaluate_all_combos(
             STRATEGIES[funded_name],
             n_eval_sims=n_eval_sims,
             n_funded_sims=n_funded_sims,
+            df_1m=df_1m,
         )
         results.append(result)
 
@@ -958,6 +990,7 @@ def grid_search(
     param_grid: Dict[str, List],
     n_sims: int = 10_000,
     top_n: int = 10,
+    df_1m: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Grid search over parameter combinations.
@@ -1017,7 +1050,7 @@ def grid_search(
 
         # Run backtest
         try:
-            _, trades_df, _ = run_backtest(df, s, volume_col=volume_col)
+            _, trades_df, _ = run_backtest(df, s, volume_col=volume_col, df_1m=df_1m)
         except Exception:
             continue
 
@@ -1115,6 +1148,7 @@ def display_result(result: BacktestResult):
     t.add_row("Profit Factor", f"{result.profit_factor:.2f}")
     t.add_row("Sharpe (annualized)", f"{result.sharpe:.2f}")
     t.add_row("Max Drawdown", f"${result.max_drawdown:,.2f}")
+    t.add_row("Avg Trade Duration", f"{result.avg_duration_min:.0f} min")
     t.add_row("", "")
     t.add_row("[cyan]Eval Pass Rate[/]", f"[bold]{result.pass_rate:.1f}%[/]")
     t.add_row("Avg Calendar Days to Pass", f"{result.avg_cal_days:.1f}")
@@ -1274,9 +1308,12 @@ def main():
     ))
 
     console.print("Loading data...")
-    df = load_data(args.data)
+    df, df_1m = load_data(args.data)
     date_range = f"{str(df['datetime'].min())[:10]} to {str(df['datetime'].max())[:10]}"
-    console.print(f"  {len(df):,} bars | {date_range}\n")
+    bars_label = f"{len(df):,} 5m bars"
+    if df_1m is not None:
+        bars_label += f" ({len(df_1m):,} 1m bars for stops)"
+    console.print(f"  {bars_label} | {date_range}\n")
 
     # ── Grid Search ──────────────────────────────────────────────────
     if args.grid:
@@ -1292,7 +1329,7 @@ def main():
             "min_down_bar_pts": [0.25, 0.5, 1.0],
         }
 
-        grid_df = grid_search(df, base, param_grid, n_sims=args.sims, top_n=15)
+        grid_df = grid_search(df, base, param_grid, n_sims=args.sims, top_n=15, df_1m=df_1m)
         if not grid_df.empty:
             display_grid_results(grid_df)
         return
@@ -1318,7 +1355,7 @@ def main():
 
         console.print(f"[bold]Coast Mode Test — base strategy: {strategy_name}[/]\n")
         strat = STRATEGIES[strategy_name]
-        _, trades_df, _ = run_backtest(df, strat)
+        _, trades_df, _ = run_backtest(df, strat, df_1m=df_1m)
 
         if trades_df.empty:
             console.print("[red]No trades generated[/]")
@@ -1391,11 +1428,11 @@ def main():
                 console.print(f"[red]Unknown funded strategy: {args.funded_strategy}[/]")
                 console.print(f"Available: {', '.join(STRATEGIES.keys())}")
                 return
-            result = evaluate_combo(df, eval_strat, funded_strat, n_eval_sims=args.sims)
+            result = evaluate_combo(df, eval_strat, funded_strat, n_eval_sims=args.sims, df_1m=df_1m)
             display_combo_detail(result)
         else:
             # All combos
-            combo_results = evaluate_all_combos(df, n_eval_sims=args.sims)
+            combo_results = evaluate_all_combos(df, n_eval_sims=args.sims, df_1m=df_1m)
             display_combo_results(combo_results)
             console.print()
             if combo_results:
@@ -1410,7 +1447,7 @@ def main():
             console.print(f"Available: {', '.join(STRATEGIES.keys())}")
             return
 
-        result = evaluate_strategy(df, STRATEGIES[args.strategy], n_eval_sims=args.sims)
+        result = evaluate_strategy(df, STRATEGIES[args.strategy], n_eval_sims=args.sims, df_1m=df_1m)
         display_result(result)
         return
 
@@ -1418,7 +1455,7 @@ def main():
     console.print(f"[bold]Running {len(STRATEGIES)} strategies...[/]\n")
     results = []
     for name, strategy in STRATEGIES.items():
-        result = evaluate_strategy(df, strategy, n_eval_sims=args.sims)
+        result = evaluate_strategy(df, strategy, n_eval_sims=args.sims, df_1m=df_1m)
         results.append(result)
 
     console.print()

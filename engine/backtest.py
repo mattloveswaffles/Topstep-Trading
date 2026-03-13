@@ -499,6 +499,7 @@ def run_topstep_nq(
     trailing_stop_pts: Optional[float] = None,
     cooldown_after_loss_minutes: Optional[int] = None,
     max_daily_pnl: Optional[float] = None,
+    df_1m: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
     Topstep-style NQ strategies with fixed-point brackets (stop_pts / target_pts).
@@ -567,12 +568,42 @@ def run_topstep_nq(
     df["_prev_close"] = close.shift(1)
     df["_prev_high"] = high.shift(1)
 
+    # Build 1m bar lookup: for each 5m bar timestamp, get the 1m bars within that window
+    # This lets us check stops/targets/trailing on 1m resolution
+    _1m_bars_for_5m: Optional[Dict] = None
+    if df_1m is not None:
+        df_1m_sorted = df_1m.sort_values("datetime").copy()
+        _1m_ts = df_1m_sorted["datetime"].values
+        _1m_high = df_1m_sorted["high"].values.astype(float)
+        _1m_low = df_1m_sorted["low"].values.astype(float)
+        _1m_close = df_1m_sorted["close"].values.astype(float)
+
+        # Build index: map each 5m bar timestamp to slice of 1m bars
+        _1m_bars_for_5m = {}
+        ts_5m = df[timestamp_col].values
+        j = 0  # pointer into 1m array
+        for i in range(len(ts_5m)):
+            bar_start = ts_5m[i] - np.timedelta64(4, 'm')  # 5m bar covers [t-4m, t]
+            bar_end = ts_5m[i]
+            # Advance j to first 1m bar >= bar_start
+            while j < len(_1m_ts) and _1m_ts[j] < bar_start:
+                j += 1
+            start_j = j
+            # Find end: all 1m bars <= bar_end
+            end_j = start_j
+            while end_j < len(_1m_ts) and _1m_ts[end_j] <= bar_end:
+                end_j += 1
+            if end_j > start_j:
+                _1m_bars_for_5m[i] = (start_j, end_j)
+            j = start_j  # don't advance past — next 5m bar might overlap
+
     positions: List[int] = []
     cum_pnls: List[float] = []
     cum_pnl = 0.0
     trades: List[Dict[str, Any]] = []
     position = 0
     entry_price = None
+    entry_ts = None
     stop_level = None
     target_level = None
     partial_target_level = None
@@ -609,17 +640,20 @@ def run_topstep_nq(
                     pnl = (entry_price - exit_price) * point_value * abs(position)
                 cum_pnl += pnl
                 day_realized_pnl += pnl
+                duration_min = (ts - entry_ts).total_seconds() / 60.0 if entry_ts is not None else 0.0
                 trades.append({
                     "timestamp": ts, "instrument": "NQ", "entry_price": entry_price,
                     "exit_price": exit_price, "contracts": abs(position), "pnl": pnl,
                     "cumulative_pnl": cum_pnl, "trading_day": day,
                     "side": "long" if position > 0 else "short",
+                    "duration_min": duration_min,
                 })
                 # Set cooldown after a losing trade
                 if cooldown_after_loss_minutes is not None and pnl < 0:
                     cooldown_until = ts + pd.Timedelta(minutes=cooldown_after_loss_minutes)
                 position = 0
                 entry_price = stop_level = target_level = partial_target_level = None
+                entry_ts = None
                 partial_taken = False
                 highest_price_since_entry = None
             positions.append(position)
@@ -767,6 +801,7 @@ def run_topstep_nq(
                 entry_contracts = contracts
             position = entry_contracts
             entry_price = c
+            entry_ts = ts
             target_pts_for_trade = target_pts
             if adaptive_target and not pd.isna(atr) and not pd.isna(atr_ref):
                 target_pts_for_trade = (
@@ -787,6 +822,7 @@ def run_topstep_nq(
                 entry_contracts = contracts if a_plus_signal else base_contracts
             position = -entry_contracts
             entry_price = c
+            entry_ts = ts
             target_pts_for_trade = target_pts
             if adaptive_target and not pd.isna(atr) and not pd.isna(atr_ref):
                 target_pts_for_trade = (
@@ -805,20 +841,37 @@ def run_topstep_nq(
         is_long = position > 0
         is_short = position < 0
         if position != 0 and entry_price is not None:
-            # PESSIMISTIC: check stop BEFORE ratcheting trailing stop with current bar
-            # This avoids lookahead bias where we assume price hit the high before the low
+            # Get 1m bars for this 5m window (if available)
+            if _1m_bars_for_5m is not None and k in _1m_bars_for_5m:
+                s1, e1 = _1m_bars_for_5m[k]
+                bar_highs = _1m_high[s1:e1]
+                bar_lows = _1m_low[s1:e1]
+                bar_closes = _1m_close[s1:e1]
+            else:
+                # Fallback to single 5m bar
+                bar_highs = [h]
+                bar_lows = [l_]
+                bar_closes = [c]
 
-            if is_long:
-                if l_ <= stop_level:
-                    exit_now = True
-                    exit_price = stop_level
-                else:
+            # Iterate through sub-bars (1m or single 5m) for precise stop/target/trail
+            for bi in range(len(bar_highs)):
+                bh = bar_highs[bi]
+                bl = bar_lows[bi]
+
+                if is_long:
+                    # PESSIMISTIC: check stop first
+                    if bl <= stop_level:
+                        exit_now = True
+                        exit_price = stop_level
+                        break
+
+                    # Partial scale out
                     if (
                         partial_scale_out
                         and not partial_taken
                         and abs(position) >= 2
                         and partial_target_level is not None
-                        and h >= partial_target_level
+                        and bh >= partial_target_level
                     ):
                         scale_contracts = min(partial_exit_contracts, abs(position) - 1)
                         partial_pnl = (
@@ -846,30 +899,34 @@ def run_topstep_nq(
                             float(highest_price_since_entry) - rolling_stop_distance_pts,
                         )
 
-                    if h >= target_level:
+                    # Target check
+                    if bh >= target_level:
                         exit_now = True
                         exit_price = target_level
+                        break
 
-                # Ratchet trailing stop AFTER exit check (for next bar)
-                if not exit_now:
+                    # Ratchet trailing stop after each 1m bar
                     if trailing_stop_pts is not None:
-                        highest_price_since_entry = max(highest_price_since_entry or h, h)
+                        highest_price_since_entry = max(highest_price_since_entry or bh, bh)
                         trail_stop = highest_price_since_entry - trailing_stop_pts
                         stop_level = max(stop_level, trail_stop)
                     else:
-                        highest_price_since_entry = max(highest_price_since_entry or h, h)
+                        highest_price_since_entry = max(highest_price_since_entry or bh, bh)
 
-            elif is_short:
-                if h >= stop_level:
-                    exit_now = True
-                    exit_price = stop_level
-                else:
+                elif is_short:
+                    # PESSIMISTIC: check stop first
+                    if bh >= stop_level:
+                        exit_now = True
+                        exit_price = stop_level
+                        break
+
+                    # Partial scale out
                     if (
                         partial_scale_out
                         and not partial_taken
                         and abs(position) >= 2
                         and partial_target_level is not None
-                        and l_ <= partial_target_level
+                        and bl <= partial_target_level
                     ):
                         scale_contracts = min(partial_exit_contracts, abs(position) - 1)
                         partial_pnl = (
@@ -882,7 +939,7 @@ def run_topstep_nq(
                             "exit_price": partial_target_level, "contracts": scale_contracts, "pnl": partial_pnl,
                             "cumulative_pnl": cum_pnl, "trading_day": day,
                         })
-                        position += scale_contracts  # reduce short position
+                        position += scale_contracts
                         partial_taken = True
                         if breakeven_after_partial:
                             stop_level = min(stop_level, entry_price)
@@ -897,18 +954,19 @@ def run_topstep_nq(
                             float(highest_price_since_entry) + rolling_stop_distance_pts,
                         )
 
-                    if l_ <= target_level:
+                    # Target check
+                    if bl <= target_level:
                         exit_now = True
                         exit_price = target_level
+                        break
 
-                # Ratchet trailing stop AFTER exit check (for next bar)
-                if not exit_now:
+                    # Ratchet trailing stop after each 1m bar
                     if trailing_stop_pts is not None:
-                        highest_price_since_entry = min(highest_price_since_entry or l_, l_)
+                        highest_price_since_entry = min(highest_price_since_entry or bl, bl)
                         trail_stop = highest_price_since_entry + trailing_stop_pts
                         stop_level = min(stop_level, trail_stop)
                     else:
-                        highest_price_since_entry = min(highest_price_since_entry or l_, l_)
+                        highest_price_since_entry = min(highest_price_since_entry or bl, bl)
 
             if not exit_now:
                 last_bar = (k + 1 >= n) or (df.iloc[k + 1]["trading_day"] != day)
@@ -923,11 +981,13 @@ def run_topstep_nq(
                 pnl = (entry_price - exit_price) * point_value * abs(position)
             cum_pnl += pnl
             day_realized_pnl += pnl
+            duration_min = (ts - entry_ts).total_seconds() / 60.0 if entry_ts is not None else 0.0
             trades.append({
                 "timestamp": ts, "instrument": "NQ", "entry_price": entry_price,
                 "exit_price": exit_price, "contracts": abs(position), "pnl": pnl,
                 "cumulative_pnl": cum_pnl, "trading_day": day,
                 "side": "long" if is_long else "short",
+                "duration_min": duration_min,
             })
             trades_today += 1
             # Set cooldown after a losing trade
@@ -935,6 +995,7 @@ def run_topstep_nq(
                 cooldown_until = ts + pd.Timedelta(minutes=cooldown_after_loss_minutes)
             position = 0
             entry_price = stop_level = target_level = partial_target_level = None
+            entry_ts = None
             partial_taken = False
             highest_price_since_entry = None
 
