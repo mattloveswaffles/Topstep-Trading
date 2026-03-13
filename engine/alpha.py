@@ -27,7 +27,7 @@ from engine.backtest import (
 warnings.filterwarnings("ignore")
 console = Console()
 
-DATA_PATH = "data/nq_5m_stitched.parquet"
+DATA_PATH = "data/nq_1m.parquet"
 POINT_VALUE = 20.0
 CONTRACTS = 2
 
