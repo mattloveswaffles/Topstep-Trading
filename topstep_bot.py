@@ -662,6 +662,7 @@ class AccountState:
     trades_today: int = 0
     cooldown_until: Optional[datetime] = None  # block entries after a loss for 180 min
     last_exit_time: Optional[datetime] = None  # timestamp of last position close
+    _trade_active: bool = False  # True from order placement until RT trade confirms exit PnL
 
     # VWAP MR state (eval)
     bars_5m: list = field(default_factory=list)
@@ -1123,6 +1124,7 @@ class TradingEngine:
             acc.profit_since_payout += net
             acc.rt_trades_today.append(data)
             acc._pending_exit_cooldown = False
+            acc._trade_active = False  # Trade fully resolved — allow new entries (subject to cooldown)
             log.info(
                 f"RT trade: acct {acc_id} | "
                 f"PnL=${float(pnl):+,.2f} fees=${fees:.2f} "
@@ -1309,6 +1311,10 @@ class TradingEngine:
                         log.warning(
                             "API sync: no NQ position, syncing to flat"
                         )
+                        # Position closed on exchange — set pending cooldown
+                        # so we wait for _on_rt_trade to confirm PnL
+                        acc._pending_exit_cooldown = True
+                        acc.last_exit_time = self._now_et()
                     acc.position = 0
                     acc.entry_price = 0.0
             else:
@@ -1316,6 +1322,8 @@ class TradingEngine:
                     log.warning(
                         "API sync: no positions, syncing to flat"
                     )
+                    acc._pending_exit_cooldown = True
+                    acc.last_exit_time = self._now_et()
                 acc.position = 0
                 acc.entry_price = 0.0
 
@@ -1517,6 +1525,25 @@ class TradingEngine:
         if acc.trades_today >= EVAL_CONFIG["max_trades_per_day"]:
             return
 
+        # PRIMARY GUARD: Block entries from order placement until RT trade confirms
+        # exit PnL. This is set locally in _open_position and cleared only by
+        # _on_rt_trade, so it's immune to WebSocket timing races.
+        if acc._trade_active:
+            # Safety release: if position is flat and no RT trade for 5 min,
+            # assume WebSocket missed it and apply a conservative cooldown
+            if acc.position == 0 and acc.last_exit_time is not None:
+                stuck_seconds = (now - acc.last_exit_time).total_seconds()
+                if stuck_seconds > 300:
+                    log.warning(
+                        f"_trade_active stuck for {stuck_seconds:.0f}s — "
+                        f"force-clearing with 180min cooldown"
+                    )
+                    acc._trade_active = False
+                    acc._pending_exit_cooldown = False
+                    acc.cooldown_until = now + timedelta(minutes=180)
+            if acc._trade_active:
+                return
+
         # Block entries until RT trade event confirms PnL after exchange exit
         if getattr(acc, '_pending_exit_cooldown', False):
             return
@@ -1546,18 +1573,16 @@ class TradingEngine:
             new_stop = None
 
             if acc.position > 0:
-                bar_high = _bar_high(bars[-1])
-                rt_high = max(bar_high, current_price)
-                acc.highest_price_since_entry = max(acc.highest_price_since_entry, rt_high)
+                # Only use real-time price — bar high/low can include
+                # prices from before entry (stale 5m bar data)
+                acc.highest_price_since_entry = max(acc.highest_price_since_entry, current_price)
                 if trail_pts is not None:
                     trail_stop = acc.highest_price_since_entry - trail_pts
                     if trail_stop > acc.stop_price:
                         new_stop = trail_stop
                         acc.stop_price = trail_stop
             else:
-                bar_low = _bar_low(bars[-1])
-                rt_low = min(bar_low, current_price)
-                acc.highest_price_since_entry = min(acc.highest_price_since_entry, rt_low)
+                acc.highest_price_since_entry = min(acc.highest_price_since_entry, current_price)
                 if trail_pts is not None:
                     trail_stop = acc.highest_price_since_entry + trail_pts
                     if trail_stop < acc.stop_price:
@@ -1711,6 +1736,8 @@ class TradingEngine:
             )
 
             acc.position = contracts if side == OrderSide.BID else -contracts
+            acc._trade_active = True  # Block new entries until RT trade confirms exit
+            acc._last_entry_time = self._now_et()
             acc.entry_price = entry_price
             if side == OrderSide.BID:  # long
                 acc.stop_price = entry_price - stop_pts if stop_pts else 0.0
@@ -1950,7 +1977,8 @@ class TradingEngine:
             elif acc.phase == Phase.EVAL and acc.equity >= EVAL_PROFIT_TARGET:
                 status = Text("PASSED!", style="bold green")
             elif acc.position != 0:
-                unrealized = ((_bar_close(acc.bars_5m[-1]) if acc.bars_5m else acc.entry_price) - acc.entry_price) * POINT_VALUE * abs(acc.position)
+                cur_px = _bar_close(acc.bars_5m[-1]) if acc.bars_5m else acc.entry_price
+                unrealized = (cur_px - acc.entry_price) * POINT_VALUE * acc.position
                 ucolor = "green" if unrealized >= 0 else "red"
                 status = Text(f"OPEN ${unrealized:+,.0f}", style=f"bold {ucolor}")
             elif not market_open:
@@ -2007,8 +2035,9 @@ class TradingEngine:
                         time_str = ts_et.strftime("%H:%M:%S")
                     except Exception:
                         time_str = "?"
-                    side_str = "BUY" if t.get("side") == 0 else "SELL"
-                    side_style = "green" if t.get("side") == 0 else "red"
+                    # RT trade events report the EXIT side — flip to show entry side
+                    side_str = "SELL" if t.get("side") == 0 else "BUY"
+                    side_style = "green" if t.get("side") == 1 else "red"
                     price_str = f"{float(t.get('price', 0)):,.2f}"
                     pnl = float(t.get("profitAndLoss", 0))
                     fees = float(t.get("fees", 0))
