@@ -1,10 +1,10 @@
 """
 TopstepX Automated Trading Bot
-═══════════════════════════════
+===============================
 Runs 24/7 monitoring the market and trading NQ futures automatically.
 
-Phase 1 (EVAL):   VWAP Micro Mean-Reversion — pass the 50K combine
-Phase 2 (FUNDED): Alpha#44 — extract payouts before bust
+Phase 1 (EVAL):   VWAP Micro Mean-Reversion -- pass the 50K combine
+Phase 2 (FUNDED): VWAP Micro Mean-Reversion with coast mode -- extract payouts
 
 Supports multiple accounts simultaneously, auto-detects eval vs funded.
 
@@ -23,11 +23,13 @@ import os
 import sys
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -40,15 +42,17 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 # Configuration
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 
 load_dotenv()
 
 console = Console()
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
+
+ET = ZoneInfo("America/New_York")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,11 +69,13 @@ for _logger_name in ("signalrcore", "signalrcore.hub", "signalrcore.transport",
                       "websocket", "websockets"):
     logging.getLogger(_logger_name).setLevel(logging.CRITICAL)
 
-# Filter out "Connection closed" spam from signalrcore hitting root logger
+
 class _SignalRFilter(logging.Filter):
+    """Filter out 'Connection closed' spam from signalrcore hitting root logger."""
     def filter(self, record):
         msg = record.getMessage()
         return "Connection closed" not in msg and "Handshake" not in msg
+
 for _h in logging.root.handlers:
     _h.addFilter(_SignalRFilter())
 
@@ -79,7 +85,7 @@ class Phase(str, Enum):
     FUNDED = "funded"
 
 
-# ── Topstep Rules ────────────────────────────────────────────────────────
+# -- Topstep Rules --------------------------------------------------------
 POINT_VALUE = 20.0            # NQ $20 per point
 TICK_SIZE = 0.25              # NQ min tick
 TICK_VALUE = 5.0              # $5 per tick
@@ -93,7 +99,7 @@ PAYOUT_BAL_PCT = 0.50
 WINNING_DAY_THRESHOLD = 150.0
 WINNING_DAYS_REQUIRED = 5
 
-# ── Strategy Config ──────────────────────────────────────────────────────
+# -- Strategy Config ------------------------------------------------------
 EVAL_CONFIG = {
     "stop_pts": 5.0,
     "target_pts": 20.0,
@@ -105,27 +111,44 @@ EVAL_CONFIG = {
     "min_down_bar_pts": 0.5,
     "rsi_oversold_max": 50.0,           # effectively disabled
     "rsi_overbought_min": 50.0,         # effectively disabled
-    "day_bias_filter": False,           # no day bias — trade any day
+    "day_bias_filter": False,           # no day bias -- trade any day
     "trailing_stop_pts": 2.0,           # trail stop 2 pts behind best price
     "long_only": False,                 # trade both long and short
     "max_daily_pnl": 1600.0,           # stop trading once daily PnL hits $1600
 }
 
 FUNDED_CONFIG = {
+    "stop_pts": 5.0,
+    "target_pts": 20.0,
     "contracts": 2,
+    "max_trades_per_day": 5,
+    "session_start_min": 9 * 60 + 30,   # 9:30 AM ET
+    "session_end_min": 15 * 60 + 45,    # 3:45 PM ET
+    "min_dip_pts": 1.5,
+    "min_down_bar_pts": 0.5,
+    "rsi_oversold_max": 50.0,
+    "rsi_overbought_min": 50.0,
+    "day_bias_filter": False,
+    "trailing_stop_pts": 2.0,
+    "long_only": False,
+    "max_daily_pnl": 1600.0,
 }
 
 # Coast mode: once profit_since_payout exceeds threshold, reduce risk
 # to protect gains and grind out the 5 winning days for payout
-COAST_THRESHOLD = 1000.0       # switch to coast mode at $1000 profit since payout
+COAST_THRESHOLD = 1500.0       # switch to coast mode at $1500 profit since payout
 COAST_CONTRACTS = 1            # trade 1 contract instead of 2
-COAST_DAILY_CAP = 400.0        # stop trading for the day once up $400
+COAST_DAILY_CAP = 200.0        # stop trading for the day once up $200
+
+LOSS_COOLDOWN_MINUTES = 180    # block entries for 3 hours after a loss
+STUCK_TRADE_TIMEOUT_SECS = 300 # force-clear _trade_active if stuck this long
+MIN_EXIT_GAP_SECS = 30         # min seconds between exit and next entry
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 # ProjectX / TopstepX API Client
 # Docs: https://gateway.docs.projectx.com/
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 
 class OrderType:
     LIMIT = 1
@@ -163,22 +186,18 @@ class ProjectXAPI:
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
 
-    # ── Auth ──────────────────────────────────────────────────────────
+    # -- Auth --------------------------------------------------------------
 
     def authenticate(self) -> bool:
         """Login with API key, get JWT token."""
         try:
             resp = self.session.post(
                 f"{self.BASE_URL}/api/Auth/loginKey",
-                json={
-                    "userName": self.username,
-                    "apiKey": self.api_key,
-                },
+                json={"userName": self.username, "apiKey": self.api_key},
             )
             resp.raise_for_status()
             data = resp.json()
 
-            # Try to find token in various possible response shapes
             token = (
                 data.get("token")
                 or data.get("access_token")
@@ -186,7 +205,6 @@ class ProjectXAPI:
                 or data.get("accessToken")
             )
 
-            # Check for error
             if "errorCode" in data and data["errorCode"] != 0:
                 log.error(f"Auth error: {data}")
                 return False
@@ -201,7 +219,7 @@ class ProjectXAPI:
             log.info("Authenticated with TopstepX")
             return True
         except Exception as e:
-            log.error(f"Auth exception: {e}")
+            log.error(f"Auth exception: {e}", exc_info=True)
             return False
 
     def validate_session(self) -> bool:
@@ -230,7 +248,15 @@ class ProjectXAPI:
             return False
         return True
 
-    # ── Accounts ──────────────────────────────────────────────────────
+    def _unwrap_list(self, data, key: str, context: str) -> list:
+        """Extract list from API response (handles both bare lists and wrapped objects)."""
+        if isinstance(data, list):
+            return data
+        if not self._check_response(data, context):
+            return []
+        return data.get(key, data.get("data", []))
+
+    # -- Accounts ----------------------------------------------------------
 
     def get_accounts(self) -> List[Dict]:
         """Get all active trading accounts."""
@@ -240,15 +266,9 @@ class ProjectXAPI:
             json={"onlyActiveAccounts": True},
         )
         resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        # Wrapped response
-        if not self._check_response(data, "get_accounts"):
-            return []
-        return data.get("accounts", data.get("data", []))
+        return self._unwrap_list(resp.json(), "accounts", "get_accounts")
 
-    # ── Contracts ─────────────────────────────────────────────────────
+    # -- Contracts ---------------------------------------------------------
 
     def search_contracts(self, text: str = "NQ", live: bool = False) -> List[Dict]:
         """Search for futures contracts. Returns up to 20 results."""
@@ -258,12 +278,7 @@ class ProjectXAPI:
             json={"searchText": text, "live": live},
         )
         resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        if not self._check_response(data, "search_contracts"):
-            return []
-        return data.get("contracts", data.get("data", []))
+        return self._unwrap_list(resp.json(), "contracts", "search_contracts")
 
     def get_nq_contract(self) -> Optional[Dict]:
         """Find the active front-month NQ E-mini contract."""
@@ -276,7 +291,6 @@ class ProjectXAPI:
             cid = c.get("id", "")
             name = c.get("name", "")
             active = c.get("activeContract", True)
-            # ENQ = E-mini Nasdaq, skip MNQ/micro
             is_emini = "ENQ" in cid or ("NQ" in name and "MNQ" not in name)
             if is_emini and active:
                 return c
@@ -287,13 +301,13 @@ class ProjectXAPI:
                 return c
         return contracts[0]
 
-    # ── Orders ────────────────────────────────────────────────────────
+    # -- Orders ------------------------------------------------------------
 
     def place_market_order(
         self,
         account_id: int,
         contract_id: str,
-        side: int,           # OrderSide.BID (0) or OrderSide.ASK (1)
+        side: int,
         size: int,
         stop_loss_ticks: Optional[int] = None,
         take_profit_ticks: Optional[int] = None,
@@ -302,7 +316,7 @@ class ProjectXAPI:
         """Place a market order with optional bracket orders.
 
         If trailing_stop=True, the stop loss bracket uses TrailingStop type (5)
-        so the exchange automatically trails the stop — no local management needed.
+        so the exchange automatically trails the stop.
         """
         self.ensure_auth()
         payload = {
@@ -313,18 +327,11 @@ class ProjectXAPI:
             "size": size,
         }
 
-        # Attach bracket orders (stop loss / take profit in ticks)
         if stop_loss_ticks is not None:
             stop_type = OrderType.TRAILING_STOP if trailing_stop else OrderType.STOP
-            payload["stopLossBracket"] = {
-                "ticks": stop_loss_ticks,
-                "type": stop_type,
-            }
+            payload["stopLossBracket"] = {"ticks": stop_loss_ticks, "type": stop_type}
         if take_profit_ticks is not None:
-            payload["takeProfitBracket"] = {
-                "ticks": take_profit_ticks,
-                "type": OrderType.LIMIT,
-            }
+            payload["takeProfitBracket"] = {"ticks": take_profit_ticks, "type": OrderType.LIMIT}
 
         side_str = "BUY" if side == OrderSide.BID else "SELL"
         log.info(f"Placing order: {side_str} {size}x {contract_id} on account {account_id}")
@@ -385,12 +392,9 @@ class ProjectXAPI:
             json={"accountId": account_id},
         )
         resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        return data.get("orders", data.get("data", []))
+        return self._unwrap_list(resp.json(), "orders", "get_open_orders")
 
-    # ── Positions ─────────────────────────────────────────────────────
+    # -- Positions ---------------------------------------------------------
 
     def get_positions(self, account_id: int) -> List[Dict]:
         """Get open positions for an account."""
@@ -401,21 +405,15 @@ class ProjectXAPI:
         )
         resp.raise_for_status()
         if not resp.text or not resp.text.strip():
-            return []  # no positions
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        return data.get("positions", data.get("data", []))
+            return []
+        return self._unwrap_list(resp.json(), "positions", "get_positions")
 
     def get_trades(self, account_id: int, start_timestamp: str) -> List[Dict]:
         """Search trades for an account from a given start time."""
         self.ensure_auth()
         resp = self.session.post(
             f"{self.BASE_URL}/api/Trade/search",
-            json={
-                "accountId": account_id,
-                "startTimestamp": start_timestamp,
-            },
+            json={"accountId": account_id, "startTimestamp": start_timestamp},
         )
         resp.raise_for_status()
         if not resp.text or not resp.text.strip():
@@ -423,7 +421,7 @@ class ProjectXAPI:
         data = resp.json()
         return data.get("trades", [])
 
-    # ── Market Data ───────────────────────────────────────────────────
+    # -- Market Data -------------------------------------------------------
 
     def get_bars(
         self,
@@ -434,18 +432,15 @@ class ProjectXAPI:
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
     ) -> List[Dict]:
-        """
-        Retrieve historical bars. Max 20,000 per request.
+        """Retrieve historical bars. Max 20,000 per request.
 
         Response bars have fields: t (timestamp), o (open), h (high), l (low), c (close), v (volume)
         """
         self.ensure_auth()
 
-        # Default time range: last N days
         if not end_time:
             end_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if not start_time:
-            # Estimate how far back we need based on limit and bar size
             days_back = max(7, (limit * unit_number) // (60 * 24) + 5)
             start_dt = datetime.now(timezone.utc) - timedelta(days=days_back)
             start_time = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -462,26 +457,17 @@ class ProjectXAPI:
         }
 
         log.debug(f"Bars request: {inner}")
-        resp = self.session.post(
-            f"{self.BASE_URL}/api/History/retrieveBars",
-            json=inner,
-        )
+        resp = self.session.post(f"{self.BASE_URL}/api/History/retrieveBars", json=inner)
         if resp.status_code != 200:
             log.error(f"Bars response {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
-        data = resp.json()
-
-        if isinstance(data, list):
-            return data
-        if not self._check_response(data, "get_bars"):
-            return []
-        return data.get("bars", data.get("data", []))
+        return self._unwrap_list(resp.json(), "bars", "get_bars")
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 # Real-Time WebSocket Client (SignalR)
 # Docs: https://gateway.docs.projectx.com/docs/realtime/
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 
 RTC_BASE = "https://rtc.topstepx.com"
 USER_HUB_URL = f"{RTC_BASE}/hubs/user"
@@ -518,7 +504,7 @@ class RealtimeClient:
         self._account_ids: List[int] = []
         self._contract_ids: List[str] = []
 
-    # ── Event Handlers ─────────────────────────────────────────────
+    # -- Event Handlers ----------------------------------------------------
 
     def _handle_account(self, args):
         data = args[0] if isinstance(args, (list, tuple)) and args else args
@@ -545,12 +531,11 @@ class RealtimeClient:
             self.on_order_update(data)
 
     def _handle_quote(self, args):
-        # Quote events come as [contractId, data]
         data = args[1] if isinstance(args, (list, tuple)) and len(args) > 1 else args
         if self.on_quote_update:
             self.on_quote_update(data)
 
-    # ── Connection Callbacks ───────────────────────────────────────
+    # -- Connection Callbacks ----------------------------------------------
 
     def _on_user_open(self):
         log.info("RT User Hub connected - subscribing...")
@@ -573,7 +558,7 @@ class RealtimeClient:
     def _on_error(self, data):
         log.error(f"RT WebSocket error: {data}")
 
-    # ── Start / Stop ───────────────────────────────────────────────
+    # -- Start / Stop ------------------------------------------------------
 
     def subscribe(self, account_ids: List[int], contract_ids: List[str]):
         self._account_ids = account_ids
@@ -587,7 +572,7 @@ class RealtimeClient:
             .with_url(url, options={
                 "access_token_factory": self._token_factory,
                 "skip_negotiation": True,
-                "type": 1,  # WebSocket transport
+                "type": 1,
             }) \
             .with_automatic_reconnect({
                 "type": "interval",
@@ -601,7 +586,6 @@ class RealtimeClient:
         if self._running:
             return
 
-        # User Hub — account, positions, trades, orders
         self._user_conn = self._build_connection(USER_HUB_URL)
         self._user_conn.on("GatewayUserAccount", self._handle_account)
         self._user_conn.on("GatewayUserPosition", self._handle_position)
@@ -611,7 +595,6 @@ class RealtimeClient:
         self._user_conn.on_close(self._on_close)
         self._user_conn.on_error(self._on_error)
 
-        # Market Hub — live quotes
         self._market_conn = self._build_connection(MARKET_HUB_URL)
         self._market_conn.on("GatewayQuote", self._handle_quote)
         self._market_conn.on_open(self._on_market_open)
@@ -633,9 +616,25 @@ class RealtimeClient:
             log.info("RT WebSocket stopped")
 
 
-# ═════════════════════════════════════════════════════════════════════════
-# Account Tracker — tracks state per account
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
+# Account State -- tracks per-account trading state
+# =========================================================================
+
+class EntryGuard(str, Enum):
+    """Why entries are currently blocked for an account.
+
+    CLEAR          -- ready to trade
+    TRADE_ACTIVE   -- order placed, waiting for RT trade to confirm exit PnL
+    PENDING_EXIT   -- position went flat on exchange, waiting for RT trade event
+    COOLDOWN       -- post-loss cooldown (180 min)
+    EXIT_GAP       -- minimum 30s gap after any exit
+    """
+    CLEAR = "clear"
+    TRADE_ACTIVE = "trade_active"
+    PENDING_EXIT = "pending_exit"
+    COOLDOWN = "cooldown"
+    EXIT_GAP = "exit_gap"
+
 
 @dataclass
 class AccountState:
@@ -653,25 +652,23 @@ class AccountState:
     trading_days: int = 0
 
     # Position tracking
-    position: int = 0             # current contracts held (0 = flat)
+    position: int = 0             # signed contract count (positive=long, negative=short, 0=flat)
     entry_price: float = 0.0
     stop_price: float = 0.0
     target_price: float = 0.0
     highest_price_since_entry: float = 0.0
-    stop_order_id: Optional[int] = None   # exchange stop order ID for trail modification
+    stop_order_id: Optional[int] = None
+
+    # Entry guard state (replaces overlapping _trade_active / _pending_exit_cooldown / cooldown_until)
     trades_today: int = 0
-    cooldown_until: Optional[datetime] = None  # block entries after a loss for 180 min
-    last_exit_time: Optional[datetime] = None  # timestamp of last position close
-    _trade_active: bool = False  # True from order placement until RT trade confirms exit PnL
+    cooldown_until: Optional[datetime] = None
+    last_exit_time: Optional[datetime] = None
+    _trade_active: bool = False
+    _pending_exit_cooldown: bool = False
 
     # VWAP MR state (eval)
     bars_5m: list = field(default_factory=list)
     vwap: float = 0.0
-
-    # Alpha#44 state (funded)
-    alpha_signal: float = 0.0
-    alpha_direction: str = "FLAT"   # "LONG" or "FLAT"
-    entered_today: bool = False
 
     # Funded payout tracking
     winning_days: int = 0
@@ -687,41 +684,72 @@ class AccountState:
     active: bool = True
     last_error: str = ""
 
+    def entry_blocked(self, now: datetime) -> EntryGuard:
+        """Single source of truth for whether entries are blocked and why.
 
-# ═════════════════════════════════════════════════════════════════════════
-# Alpha#44 Signal Computation
-# ═════════════════════════════════════════════════════════════════════════
+        Checks guards in priority order. Returns EntryGuard.CLEAR when ready to trade.
+        """
+        if self._trade_active:
+            # Safety release: if position is flat and stuck for too long,
+            # the caller should force-clear before re-checking.
+            return EntryGuard.TRADE_ACTIVE
 
-def compute_alpha044(daily_df: pd.DataFrame) -> float:
-    """
-    Alpha#44: -1 * correlation(high, rank(volume), 5)
-    Returns today's signal value. > 0 means go LONG tomorrow.
-    """
-    if len(daily_df) < 10:
-        return 0.0
+        if self._pending_exit_cooldown:
+            return EntryGuard.PENDING_EXIT
 
-    high = daily_df["high"].astype(float)
-    volume = daily_df["volume"].astype(float)
+        if self.last_exit_time is not None:
+            if (now - self.last_exit_time).total_seconds() < MIN_EXIT_GAP_SECS:
+                return EntryGuard.EXIT_GAP
 
-    # rank = rolling percentile rank over 252 days
-    vol_rank = volume.rolling(min(252, len(daily_df)), min_periods=1).apply(
-        lambda s: pd.Series(s).rank().iloc[-1] / len(s), raw=False
-    )
+        if self.cooldown_until is not None and now < self.cooldown_until:
+            return EntryGuard.COOLDOWN
 
-    # correlation(high, rank(volume), 5)
-    corr = high.rolling(5, min_periods=2).corr(vol_rank)
+        return EntryGuard.CLEAR
 
-    signal = -1 * corr
-    val = signal.iloc[-1]
-    return float(val) if not np.isnan(val) else 0.0
+    def clear_position_state(self):
+        """Reset all position-related fields to flat."""
+        self.entry_price = 0.0
+        self.stop_price = 0.0
+        self.target_price = 0.0
+        self.highest_price_since_entry = 0.0
+        self.stop_order_id = None
+
+    def apply_loss_cooldown(self, now: datetime):
+        """Set the post-loss cooldown timer."""
+        self.cooldown_until = now + timedelta(minutes=LOSS_COOLDOWN_MINUTES)
+
+    def cooldown_remaining(self, now: datetime) -> Optional[timedelta]:
+        """Return remaining cooldown duration, or None if not in cooldown."""
+        if self.cooldown_until is not None and now < self.cooldown_until:
+            return self.cooldown_until - now
+        return None
 
 
-# ═════════════════════════════════════════════════════════════════════════
+
+# =========================================================================
 # VWAP MR Signal Computation (real-time on 5m bars)
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
+
+# -- Bar field accessors (API returns t/o/h/l/c/v shorthand) --------------
+
+def _bar_close(b: dict) -> float:
+    return float(b.get("c", b.get("close", 0)))
+
+def _bar_open(b: dict) -> float:
+    return float(b.get("o", b.get("open", 0)))
+
+def _bar_high(b: dict) -> float:
+    return float(b.get("h", b.get("high", 0)))
+
+def _bar_low(b: dict) -> float:
+    return float(b.get("l", b.get("low", 0)))
+
+def _bar_time(b: dict) -> str:
+    return str(b.get("t", b.get("timestamp", "")))
+
 
 def compute_vwap(bars: List[Dict]) -> float:
-    """Compute VWAP from today's bars. Uses t/o/h/l/c/v field names."""
+    """Compute VWAP from today's bars."""
     if not bars:
         return 0.0
     cum_tp_vol = 0.0
@@ -742,10 +770,8 @@ def compute_rsi(closes: List[float], period: int = 14) -> float:
     if len(closes) < period + 1:
         return 50.0
     deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    # Seed with simple average of first `period` deltas
     avg_gain = sum(max(d, 0) for d in deltas[:period]) / period
     avg_loss = sum(max(-d, 0) for d in deltas[:period]) / period
-    # Wilder smoothing: ewm(alpha=1/period, adjust=False)
     alpha = 1.0 / period
     for d in deltas[period:]:
         avg_gain = alpha * max(d, 0) + (1 - alpha) * avg_gain
@@ -756,32 +782,12 @@ def compute_rsi(closes: List[float], period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
-def _bar_close(b: dict) -> float:
-    return float(b.get("c", b.get("close", 0)))
-
-def _bar_open(b: dict) -> float:
-    return float(b.get("o", b.get("open", 0)))
-
-def _bar_high(b: dict) -> float:
-    return float(b.get("h", b.get("high", 0)))
-
-def _bar_low(b: dict) -> float:
-    return float(b.get("l", b.get("low", 0)))
-
-def _bar_time(b: dict) -> str:
-    return str(b.get("t", b.get("timestamp", "")))
-
-
 def _compute_day_bias(bars: List[Dict], config: dict) -> dict:
     """Compute day bias features matching backtest _session_day_features.
 
-    Returns dict with session_open, prev_day_close, first_window_move, gap_ok, window_ok.
-    Bars should be today's UTC-date bars. We need prev day's close from daily bars
-    or from earlier bars in the list.
+    Returns dict with session_open, first_window_move.
     """
-    from zoneinfo import ZoneInfo
-    et = ZoneInfo("America/New_York")
-    session_start = config["session_start_min"]  # 570 = 9:30
+    session_start = config["session_start_min"]
     first_window_end = session_start + config.get("day_bias_first_window_minutes", 15)
 
     session_open = None
@@ -791,7 +797,7 @@ def _compute_day_bias(bars: List[Dict], config: dict) -> dict:
         dt = pd.to_datetime(b["t"])
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        dt_et = dt.astimezone(et)
+        dt_et = dt.astimezone(ET)
         mins = dt_et.hour * 60 + dt_et.minute
 
         if mins >= session_start and session_open is None:
@@ -809,10 +815,38 @@ def _compute_day_bias(bars: List[Dict], config: dict) -> dict:
     }
 
 
+def _check_day_bias(bars: List[Dict], config: dict, prev_day_close: Optional[float],
+                     bearish: bool = False) -> bool:
+    """Check day bias filter conditions. Returns True if bias is favorable.
+
+    For longs: gap UP + first window move UP.
+    For shorts (bearish=True): gap DOWN + first window move DOWN.
+    Returns True (pass) if day_bias_filter is disabled.
+    """
+    if not config.get("day_bias_filter", False):
+        return True
+
+    bias = _compute_day_bias(bars, config)
+    session_open = bias["session_open"]
+    first_window_move = bias["first_window_move"]
+    min_gap = config.get("day_bias_min_gap_pts", 3.0)
+    min_fw_move = config.get("day_bias_min_first_window_move_pts", 0.0)
+
+    if prev_day_close is None or session_open is None or first_window_move is None:
+        return False
+
+    gap = session_open - prev_day_close
+
+    if bearish:
+        return gap <= -min_gap and first_window_move <= -min_fw_move
+    else:
+        return gap >= min_gap and first_window_move >= min_fw_move
+
+
 def check_vwap_mr_entry(bars: List[Dict], config: dict,
                          prev_day_close: float = None) -> bool:
-    """
-    Check VWAP Micro MR LONG entry conditions on current 5m bar.
+    """Check VWAP Micro MR LONG entry conditions on current 5m bar.
+
     Matches backtest (lm.py run_topstep_nq) exactly:
       1. c < prev_bar_close  (price dropping)
       2. dip >= 1.5 pts below VWAP  (high_prob)
@@ -823,65 +857,29 @@ def check_vwap_mr_entry(bars: List[Dict], config: dict,
     if len(bars) < 2:
         return False
 
-    current = bars[-1]
-    prev_bar = bars[-2]
-    price = _bar_close(current)
-    o = _bar_open(current)
-    prev_bar_close = _bar_close(prev_bar)
+    price = _bar_close(bars[-1])
+    o = _bar_open(bars[-1])
+    prev_bar_close = _bar_close(bars[-2])
     vwap = compute_vwap(bars)
 
-    # Base MR condition: below VWAP and close < previous bar's close
     if price >= prev_bar_close:
         return False
-
-    # Dip below VWAP (high_prob: >= min_dip_pts, also covers min_vwap_distance=1.0)
-    dip = vwap - price
-    if dip < config["min_dip_pts"]:
+    if vwap - price < config["min_dip_pts"]:
+        return False
+    if price >= o or o - price < config["min_down_bar_pts"]:
         return False
 
-    # Bearish bar (close < open, down >= min_down_bar_pts)
-    if price >= o:
-        return False
-    down_bar = o - price
-    if down_bar < config["min_down_bar_pts"]:
-        return False
-
-    # RSI oversold (Wilder smoothing)
     closes = [_bar_close(b) for b in bars]
-    rsi = compute_rsi(closes, 14)
-    if rsi >= config["rsi_oversold_max"]:
+    if compute_rsi(closes, 14) >= config["rsi_oversold_max"]:
         return False
 
-    # Day bias filter: gap up + first window move (matches backtest)
-    if config.get("day_bias_filter", False):
-        bias = _compute_day_bias(bars, config)
-        session_open = bias["session_open"]
-        first_window_move = bias["first_window_move"]
-
-        # Gap: session_open - prev_day_close >= min_gap_pts
-        min_gap = config.get("day_bias_min_gap_pts", 3.0)
-        if prev_day_close is not None and session_open is not None:
-            gap = session_open - prev_day_close
-            if gap < min_gap:
-                return False
-        else:
-            return False  # can't verify day bias without prev close
-
-        # First window move >= threshold
-        min_fw_move = config.get("day_bias_min_first_window_move_pts", 0.0)
-        if first_window_move is not None:
-            if first_window_move < min_fw_move:
-                return False
-        else:
-            return False  # not enough bars in session yet
-
-    return True
+    return _check_day_bias(bars, config, prev_day_close, bearish=False)
 
 
 def check_vwap_mr_short_entry(bars: List[Dict], config: dict,
                                prev_day_close: float = None) -> bool:
-    """
-    Check VWAP Micro MR SHORT entry conditions (mirror of long).
+    """Check VWAP Micro MR SHORT entry conditions (mirror of long).
+
     Matches backtest (lm.py run_topstep_nq) short logic:
       1. c > prev_bar_close  (price rising)
       2. spike >= 1.5 pts above VWAP  (high_prob)
@@ -892,59 +890,23 @@ def check_vwap_mr_short_entry(bars: List[Dict], config: dict,
     if len(bars) < 2:
         return False
 
-    current = bars[-1]
-    prev_bar = bars[-2]
-    price = _bar_close(current)
-    o = _bar_open(current)
-    prev_bar_close = _bar_close(prev_bar)
+    price = _bar_close(bars[-1])
+    o = _bar_open(bars[-1])
+    prev_bar_close = _bar_close(bars[-2])
     vwap = compute_vwap(bars)
 
-    # Base MR condition: above VWAP and close > previous bar's close
     if price <= prev_bar_close:
         return False
-
-    # Spike above VWAP (high_prob: >= min_dip_pts, covers min_vwap_distance=1.0)
-    spike = price - vwap
-    if spike < config["min_dip_pts"]:
+    if price - vwap < config["min_dip_pts"]:
+        return False
+    if price <= o or price - o < config["min_down_bar_pts"]:
         return False
 
-    # Bullish bar (close > open, up >= min_down_bar_pts)
-    if price <= o:
-        return False
-    up_bar = price - o
-    if up_bar < config["min_down_bar_pts"]:
-        return False
-
-    # RSI overbought
     closes = [_bar_close(b) for b in bars]
-    rsi = compute_rsi(closes, 14)
-    if rsi <= config.get("rsi_overbought_min", 55.0):
+    if compute_rsi(closes, 14) <= config.get("rsi_overbought_min", 55.0):
         return False
 
-    # Day bias filter: gap DOWN + first window move DOWN (bearish day)
-    if config.get("day_bias_filter", False):
-        bias = _compute_day_bias(bars, config)
-        session_open = bias["session_open"]
-        first_window_move = bias["first_window_move"]
-
-        # Gap: session_open - prev_day_close <= -min_gap_pts (gap down)
-        min_gap = config.get("day_bias_min_gap_pts", 3.0)
-        if prev_day_close is not None and session_open is not None:
-            gap = session_open - prev_day_close
-            if gap > -min_gap:  # need gap DOWN
-                return False
-        else:
-            return False
-
-        # First window move <= -threshold (bearish)
-        min_fw_move = config.get("day_bias_min_first_window_move_pts", 0.0)
-        if first_window_move is not None:
-            if first_window_move > -min_fw_move:  # need move DOWN
-                return False
-        else:
-            return False
-
-    return True
+    return _check_day_bias(bars, config, prev_day_close, bearish=True)
 
 
 def pts_to_ticks(pts: float) -> int:
@@ -952,9 +914,334 @@ def pts_to_ticks(pts: float) -> int:
     return int(pts / TICK_SIZE)
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
+# Dashboard Builder
+# =========================================================================
+
+class DashboardBuilder:
+    """Renders the Rich TUI dashboard. Separated from trading logic for clarity."""
+
+    def __init__(self, engine: "TradingEngine"):
+        self._engine = engine
+
+    def build(self) -> Table:
+        """Build the full dashboard as a Rich Table grid."""
+        eng = self._engine
+        now = eng._now_et()
+        market_open = eng._is_market_hours(now)
+        in_session = eng._is_eval_session(now)
+
+        outer = Table.grid(padding=(0, 0))
+        outer.add_row(self._build_header(now, market_open, in_session))
+        outer.add_row(Text(""))
+        outer.add_row(self._build_market_conditions(market_open, in_session))
+        outer.add_row(Text(""))
+        outer.add_row(self._build_accounts_table(now, market_open, in_session))
+        outer.add_row(Text(""))
+
+        trade_table = self._build_trade_history()
+        if trade_table is not None:
+            outer.add_row(trade_table)
+
+        if eng._activity_log:
+            outer.add_row(Text(""))
+            outer.add_row(self._build_activity_log())
+
+        return outer
+
+    def _build_header(self, now: datetime, market_open: bool, in_session: bool) -> Text:
+        eng = self._engine
+        market_str = "[bold green]OPEN[/]" if market_open else "[bold red]CLOSED[/]"
+        session_str = "[green]IN SESSION[/]" if in_session else "[dim]OUT[/]"
+
+        pos_str = "[dim]FLAT[/]"
+        for acc in eng.accounts.values():
+            if acc.position > 0:
+                pos_str = f"[bold green]{acc.position}x LONG @ {acc.entry_price:,.2f}[/]"
+            elif acc.position < 0:
+                pos_str = f"[bold red]{abs(acc.position)}x SHORT @ {acc.entry_price:,.2f}[/]"
+            break
+
+        rt_str = "[green]WS[/]" if eng._rt_connected else "[red]REST[/]"
+        rt_price = getattr(eng, '_last_price', None)
+        rt_price_str = f"  |  RT: ${rt_price:,.2f}" if rt_price else ""
+
+        return Text.from_markup(
+            f" [bold]TopstepX Bot[/]  |  {now.strftime('%Y-%m-%d %H:%M:%S ET')}  |  "
+            f"Market: {market_str}  |  Session: {session_str}  |  "
+            f"Position: {pos_str}  |  {eng.contract_name}  |  "
+            f"Feed: {rt_str}{rt_price_str}"
+        )
+
+    def _build_market_conditions(self, market_open: bool, in_session: bool) -> Panel:
+        """Build the market conditions panel using data from the first eval account."""
+        eng = self._engine
+        price_str = vwap_str = dip_str = rsi_str = dist_str = "-"
+        bias_str = "-"
+        entry_str = "[dim]NO[/]"
+
+        bars = None
+        prev_day_close = self._get_prev_day_close()
+
+        for acc in eng.accounts.values():
+            if not acc.bars_5m:
+                continue
+            bars = acc.bars_5m
+            price = _bar_close(bars[-1])
+            vwap = acc.vwap
+            price_str = f"{price:,.2f}"
+            vwap_str = f"{vwap:,.2f}"
+
+            if vwap > 0:
+                dip = vwap - price
+                dip_color = "green" if dip >= 2.5 else "red"
+                dip_str = f"[{dip_color}]{dip:+.2f} pts[/]"
+
+                entry_level = vwap - EVAL_CONFIG["min_dip_pts"]
+                distance = price - entry_level
+                if distance > 0:
+                    dist_str = f"[yellow]{distance:.2f} pts above[/] ({entry_level:,.2f})"
+                else:
+                    dist_str = f"[green]IN ZONE[/] ({abs(distance):.2f} below)"
+
+            closes = [_bar_close(b) for b in bars]
+            rsi = compute_rsi(closes, 14)
+            rsi_color = "green" if rsi < 45 else "red"
+            rsi_str = f"[{rsi_color}]{rsi:.1f}[/]"
+
+            bias_str = self._format_day_bias(bars, prev_day_close)
+            entry_str = self._format_entry_signal(bars, prev_day_close)
+            break
+
+        cond = Table.grid(padding=(0, 4))
+        cond.add_column(style="bold", width=16)
+        cond.add_column(width=24)
+        cond.add_column(style="bold", width=16)
+        cond.add_column(width=24)
+        cond.add_row("Price:", price_str, "VWAP:", vwap_str)
+        cond.add_row("Dip from VWAP:", dip_str, "RSI(14):", rsi_str)
+        cond.add_row("Day Bias:", bias_str, "Entry Signal:", entry_str)
+        cond.add_row("Dist to Entry:", dist_str, "", "")
+
+        return Panel(cond, title="Market Conditions", border_style="cyan", expand=True)
+
+    def _format_day_bias(self, bars: List[Dict], prev_day_close: Optional[float]) -> str:
+        if not EVAL_CONFIG.get("day_bias_filter", False):
+            return "[green]ANY[/] (no bias filter)"
+
+        bias = _compute_day_bias(bars, EVAL_CONFIG)
+        min_gap = EVAL_CONFIG.get("day_bias_min_gap_pts", 3.0)
+        min_fw = EVAL_CONFIG.get("day_bias_min_first_window_move_pts", 0.0)
+
+        if bias["session_open"] is None or prev_day_close is None:
+            return "[dim]N/A[/]"
+
+        gap = bias["session_open"] - prev_day_close
+        gap_bull = gap >= min_gap
+        fw_bull = bias["first_window_move"] is not None and bias["first_window_move"] >= min_fw
+        gap_bear = gap <= -min_gap
+        fw_bear = bias["first_window_move"] is not None and bias["first_window_move"] <= -min_fw
+
+        if gap_bull and fw_bull:
+            return f"[green]BULL[/] (gap {gap:+.1f})"
+        elif gap_bear and fw_bear:
+            return f"[yellow]BEAR[/] (gap {gap:+.1f})"
+        else:
+            return f"[red]FLAT[/] (gap {gap:+.1f})"
+
+    def _format_entry_signal(self, bars: List[Dict], prev_day_close: Optional[float]) -> str:
+        long_met = check_vwap_mr_entry(bars, EVAL_CONFIG, prev_day_close=prev_day_close)
+        short_met = (
+            not EVAL_CONFIG.get("long_only", True)
+            and check_vwap_mr_short_entry(bars, EVAL_CONFIG, prev_day_close=prev_day_close)
+        )
+        if long_met:
+            return "[bold green]LONG[/]"
+        elif short_met:
+            return "[bold yellow]SHORT[/]"
+        return "[dim]NO[/]"
+
+    def _get_prev_day_close(self) -> Optional[float]:
+        eng = self._engine
+        if eng._daily_bars is not None and len(eng._daily_bars) >= 2:
+            today_utc = datetime.now(timezone.utc).date()
+            prev_days = eng._daily_bars[eng._daily_bars["date"] < today_utc]
+            if not prev_days.empty:
+                return float(prev_days.iloc[-1]["close"])
+        return None
+
+    def _build_accounts_table(self, now: datetime, market_open: bool, in_session: bool) -> Table:
+        eng = self._engine
+        tbl = Table(show_lines=True, expand=True, show_header=True, padding=(0, 2))
+        tbl.add_column("Account", style="bold", ratio=4, no_wrap=True)
+        tbl.add_column("Phase", justify="center", ratio=1)
+        tbl.add_column("Equity", justify="right", ratio=2)
+        tbl.add_column("DD Left", justify="right", ratio=2)
+        tbl.add_column("Day PnL", justify="right", ratio=2)
+        tbl.add_column("Position", justify="center", ratio=2)
+        tbl.add_column("Trades", justify="center", ratio=1)
+        tbl.add_column("Status", justify="center", ratio=2)
+
+        for acc in eng.accounts.values():
+            max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
+            dd_left = max_dd - (acc.peak - acc.equity)
+
+            phase_text = Text(acc.phase.value.upper())
+            phase_text.stylize("green" if acc.phase == Phase.EVAL else "blue")
+
+            equity_text = Text(f"${acc.equity:,.2f}")
+            equity_text.stylize("green" if acc.equity >= 0 else "red")
+
+            dd_text = Text(f"${dd_left:,.2f}")
+            dd_text.stylize("green" if dd_left > 500 else "yellow" if dd_left > 200 else "red")
+
+            day_text = Text(f"${acc.daily_pnl:+,.2f}")
+            day_text.stylize("green" if acc.daily_pnl >= 0 else "red")
+
+            if acc.position > 0:
+                pos = f"{acc.position}x LONG"
+            elif acc.position < 0:
+                pos = f"{abs(acc.position)}x SHORT"
+            else:
+                pos = "flat"
+            pos_text = Text(pos)
+            pos_text.stylize("cyan" if acc.position != 0 else "dim")
+
+            status = self._account_status(acc, now, market_open, in_session)
+
+            extra = ""
+            if acc.phase == Phase.FUNDED:
+                extra = f"\nW-days: {acc.winning_days}/{WINNING_DAYS_REQUIRED} | Extracted: ${acc.total_extracted:,.0f}"
+
+            tbl.add_row(
+                f"{acc.name} ({acc.account_id}){extra}",
+                phase_text,
+                equity_text,
+                dd_text,
+                day_text,
+                pos_text,
+                f"{acc.trades_today}/{EVAL_CONFIG['max_trades_per_day']}",
+                status,
+            )
+        return tbl
+
+    def _account_status(self, acc: AccountState, now: datetime,
+                        market_open: bool, in_session: bool) -> Text:
+        if not acc.active:
+            return Text("BUST", style="bold red")
+
+        if acc.phase == Phase.EVAL and acc.equity >= EVAL_PROFIT_TARGET:
+            return Text("PASSED!", style="bold green")
+
+        if acc.position != 0:
+            cur_px = _bar_close(acc.bars_5m[-1]) if acc.bars_5m else acc.entry_price
+            # Use signed position for correct unrealized P&L (negative for shorts)
+            unrealized = (cur_px - acc.entry_price) * POINT_VALUE * acc.position
+            ucolor = "green" if unrealized >= 0 else "red"
+            return Text(f"OPEN ${unrealized:+,.0f}", style=f"bold {ucolor}")
+
+        if not market_open:
+            return Text("MKT CLOSED", style="dim")
+
+        if not in_session and acc.phase == Phase.EVAL:
+            return Text("WAIT SESSION", style="dim")
+
+        remaining = acc.cooldown_remaining(now)
+        if remaining is not None:
+            total_secs = int(remaining.total_seconds())
+            hours = total_secs // 3600
+            mins = (total_secs % 3600) // 60
+            if hours > 0:
+                return Text(f"COOLDOWN: {hours}h {mins}m", style="bold red")
+            else:
+                secs = total_secs % 60
+                return Text(f"COOLDOWN: {mins}m {secs}s", style="bold red")
+
+        if acc._pending_exit_cooldown:
+            return Text("PENDING EXIT", style="bold magenta")
+
+        if acc._trade_active:
+            return Text("TRADE ACTIVE", style="bold cyan")
+
+        return Text("SCANNING", style="yellow")
+
+    def _build_trade_history(self) -> Optional[Table]:
+        """Build today's trade history table from real-time data."""
+        eng = self._engine
+        for acc in eng.accounts.values():
+            exit_trades = acc.rt_trades_today
+            if not exit_trades:
+                break
+
+            tbl = Table(
+                show_lines=False, expand=True,
+                title="Today's Trades (live)",
+                title_style="bold cyan",
+            )
+            tbl.add_column("Time (ET)", ratio=2)
+            tbl.add_column("Side", justify="center", ratio=1)
+            tbl.add_column("Size", justify="center", ratio=1)
+            tbl.add_column("Price", justify="right", ratio=2)
+            tbl.add_column("PnL", justify="right", ratio=2)
+            tbl.add_column("Fees", justify="right", ratio=1)
+
+            for t in exit_trades:
+                ts_raw = t.get("creationTimestamp") or t.get("timestamp", "")
+                try:
+                    ts = pd.to_datetime(ts_raw)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    time_str = ts.astimezone(ET).strftime("%H:%M:%S")
+                except Exception:
+                    time_str = "?"
+
+                # RT trade events report the EXIT side -- flip to show entry side
+                side_str = "SELL" if t.get("side") == 0 else "BUY"
+                side_style = "green" if t.get("side") == 1 else "red"
+                price_str = f"{float(t.get('price', 0)):,.2f}"
+                pnl = float(t.get("profitAndLoss", 0))
+                fees = float(t.get("fees", 0))
+                net = pnl - fees
+                net_style = "green" if net >= 0 else "red"
+                tbl.add_row(
+                    time_str,
+                    f"[{side_style}]{side_str}[/]",
+                    str(t.get("size", "")),
+                    price_str,
+                    f"[{net_style}]${pnl:+,.2f}[/]",
+                    f"${fees:.2f}",
+                )
+
+            total_pnl = sum(float(t.get("profitAndLoss", 0)) for t in exit_trades)
+            total_fees = sum(float(t.get("fees", 0)) for t in exit_trades)
+            net_total = total_pnl - total_fees
+            ns = "green" if net_total >= 0 else "red"
+            tbl.add_row(
+                "[bold]TOTAL[/]", "", "", "",
+                f"[bold {ns}]${net_total:+,.2f}[/]",
+                f"${total_fees:.2f}",
+            )
+            return tbl
+        return None
+
+    def _build_activity_log(self) -> Table:
+        eng = self._engine
+        tbl = Table(
+            show_lines=False, expand=True,
+            title="Activity Log",
+            title_style="bold cyan",
+            show_header=False,
+        )
+        tbl.add_column("Time", width=10, style="dim")
+        tbl.add_column("Event", ratio=1)
+        for ts, msg, style in reversed(eng._activity_log):
+            tbl.add_row(ts, f"[{style}]{msg}[/]" if style else msg)
+        return tbl
+
+
+# =========================================================================
 # Trading Engine
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 
 class TradingEngine:
     """Core trading engine managing multiple accounts."""
@@ -972,19 +1259,20 @@ class TradingEngine:
 
         # Real-time state
         self._rt: Optional[RealtimeClient] = None
-        self._last_quote: Dict = {}       # latest market quote from WebSocket
+        self._last_quote: Dict = {}
         self._rt_connected = False
 
         # Activity log for dashboard (rolling last 20 events)
-        from collections import deque
         self._activity_log: deque = deque(maxlen=20)
 
+        # Dashboard renderer
+        self._dashboard = DashboardBuilder(self)
+
     def _log_activity(self, msg: str, style: str = ""):
-        """Add an event to the dashboard activity log."""
         ts = self._now_et().strftime("%H:%M:%S")
         self._activity_log.append((ts, msg, style))
 
-    # ── Setup ─────────────────────────────────────────────────────────
+    # -- Setup -------------------------------------------------------------
 
     def setup(self):
         """Initialize: auth, find accounts, find NQ contract."""
@@ -993,7 +1281,6 @@ class TradingEngine:
         if not self.api.authenticate():
             raise ConnectionError("Failed to authenticate with TopstepX")
 
-        # Find NQ contract
         nq = self.api.get_nq_contract()
         if not nq:
             raise RuntimeError("Could not find NQ contract")
@@ -1001,7 +1288,6 @@ class TradingEngine:
         self.contract_name = nq.get("name", "")
         log.info(f"NQ contract: {self.contract_id} ({self.contract_name})")
 
-        # Load accounts
         raw_accounts = self.api.get_accounts()
         if not raw_accounts:
             raise RuntimeError("No trading accounts found")
@@ -1011,11 +1297,15 @@ class TradingEngine:
             name = acc.get("name", "")
             can_trade = acc.get("canTrade", True)
 
-            # Auto-detect phase from account name
             name_lower = name.lower()
+
+            # Skip practice/sim accounts
+            if "prac" in name_lower or "sim" in name_lower:
+                log.info(f"Skipping practice account: [{acc_id}] {name}")
+                continue
+
             is_funded = any(
-                kw in name_lower
-                for kw in ["funded", "live", "express", "payout"]
+                kw in name_lower for kw in ["funded", "live", "express", "payout"]
             )
             phase = Phase.FUNDED if is_funded else Phase.EVAL
 
@@ -1028,13 +1318,61 @@ class TradingEngine:
             )
             log.info(f"Account {acc_id}: '{name}' ->{phase.value} (canTrade={can_trade})")
 
-        # Load saved state
         self._load_state()
-
         log.info(f"Engine ready: {len(self.accounts)} account(s), contract={self.contract_id}")
 
-        # Start real-time WebSocket
+        self._startup_cooldown_check()
         self._start_realtime()
+
+    def _startup_cooldown_check(self):
+        """On startup, check the most recent trade. If it was a loss, apply cooldown."""
+        try:
+            now = self._now_et()
+            today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+
+            for acc in self.accounts.values():
+                trades = self.api.get_trades(acc.account_id, today_start)
+                if not trades:
+                    continue
+
+                trades_sorted = sorted(trades, key=self._parse_trade_timestamp)
+                last_trade = trades_sorted[-1]
+                pnl = last_trade.get("profitAndLoss")
+                fees = float(last_trade.get("fees", 0))
+
+                if pnl is not None:
+                    net_pnl = float(pnl) - fees
+                    last_ts = self._parse_trade_timestamp(last_trade)
+                    minutes_ago = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
+
+                    if net_pnl < 0 and minutes_ago < LOSS_COOLDOWN_MINUTES:
+                        remaining = LOSS_COOLDOWN_MINUTES - minutes_ago
+                        acc.cooldown_until = now + timedelta(minutes=remaining)
+                        acc.last_exit_time = now
+                        log.info(
+                            f"Startup cooldown: acct {acc.account_id} | last trade was "
+                            f"${net_pnl:+.2f} ({minutes_ago:.0f}min ago) | "
+                            f"cooldown until {acc.cooldown_until.strftime('%H:%M')}"
+                        )
+                    elif net_pnl < 0:
+                        log.info(f"Startup: acct {acc.account_id} | last trade was loss ${net_pnl:+.2f} but {LOSS_COOLDOWN_MINUTES}min already elapsed")
+                    else:
+                        log.info(f"Startup: acct {acc.account_id} | last trade was ${net_pnl:+.2f} -- no cooldown needed")
+
+                # Populate rt_trades_today for dashboard
+                acc.rt_trades_today = [t for t in trades if t.get("profitAndLoss") is not None]
+                acc.trades_today = len(acc.rt_trades_today)
+        except Exception as e:
+            log.warning(f"Startup cooldown check failed: {e}", exc_info=True)
+
+    @staticmethod
+    def _parse_trade_timestamp(trade: dict) -> datetime:
+        """Parse a trade's timestamp into a timezone-aware datetime."""
+        ts = trade.get("creationTimestamp") or trade.get("timestamp", "")
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
 
     def _start_realtime(self):
         """Connect SignalR WebSocket for real-time updates."""
@@ -1055,26 +1393,28 @@ class TradingEngine:
             self._rt_connected = True
             log.info("Real-time WebSocket started")
         except Exception as e:
-            log.error(f"Failed to start real-time WebSocket: {e}")
+            log.error(f"Failed to start real-time WebSocket: {e}", exc_info=True)
             self._rt_connected = False
 
-    # ── Real-Time Event Handlers ───────────────────────────────────
+    # -- Real-Time Event Handlers ------------------------------------------
 
     def _on_rt_account(self, data: dict):
         """Handle real-time account balance update."""
         acc_id = data.get("accountId") or data.get("id")
-        if acc_id and acc_id in self.accounts:
-            acc = self.accounts[acc_id]
-            balance = data.get("balance")
-            if balance is not None:
-                bal = float(balance)
-                acc.equity = bal - START_BALANCE
-                acc.peak = max(acc.peak, acc.equity)
-                log.debug(f"RT balance update: acct {acc_id} = ${bal:,.2f} (equity ${acc.equity:,.2f})")
+        if not acc_id or acc_id not in self.accounts:
+            return
+        acc = self.accounts[acc_id]
 
-            can_trade = data.get("canTrade")
-            if can_trade is not None:
-                acc.can_trade = bool(can_trade)
+        balance = data.get("balance")
+        if balance is not None:
+            bal = float(balance)
+            acc.equity = bal - START_BALANCE
+            acc.peak = max(acc.peak, acc.equity)
+            log.debug(f"RT balance update: acct {acc_id} = ${bal:,.2f} (equity ${acc.equity:,.2f})")
+
+        can_trade = data.get("canTrade")
+        if can_trade is not None:
+            acc.can_trade = bool(can_trade)
 
     def _on_rt_position(self, data: dict):
         """Handle real-time position change."""
@@ -1082,8 +1422,7 @@ class TradingEngine:
         if not acc_id or acc_id not in self.accounts:
             return
         acc = self.accounts[acc_id]
-        contract_id = data.get("contractId")
-        if contract_id != self.contract_id:
+        if data.get("contractId") != self.contract_id:
             return
 
         new_size = int(data.get("size", 0))
@@ -1096,16 +1435,14 @@ class TradingEngine:
         acc.position = new_size
         if avg_price is not None:
             acc.entry_price = float(avg_price)
+
         if new_size == 0:
-            # If we went from a position to flat via exchange (stop/target hit),
-            # block new entries until the RT trade event confirms PnL.
+            # Position went flat on exchange -- block entries until RT trade confirms PnL
             if was_in_position:
                 acc._pending_exit_cooldown = True
                 acc.last_exit_time = self._now_et()
-            acc.entry_price = 0.0
-            acc.stop_price = 0.0
-            acc.target_price = 0.0
-            acc.highest_price_since_entry = 0.0
+                self._cancel_stale_orders(acc)
+            acc.clear_position_state()
 
     def _on_rt_trade(self, data: dict):
         """Handle real-time trade execution (fills with PnL)."""
@@ -1117,41 +1454,40 @@ class TradingEngine:
         pnl = data.get("profitAndLoss")
         fees = float(data.get("fees", 0))
 
-        if pnl is not None:
-            # This is an exit trade with realized PnL
-            net = float(pnl) - fees
-            acc.daily_pnl += net
-            acc.profit_since_payout += net
-            acc.rt_trades_today.append(data)
-            acc._pending_exit_cooldown = False
-            acc._trade_active = False  # Trade fully resolved — allow new entries (subject to cooldown)
-            log.info(
-                f"RT trade: acct {acc_id} | "
-                f"PnL=${float(pnl):+,.2f} fees=${fees:.2f} "
-                f"net=${net:+,.2f} | "
-                f"profit_since_payout=${acc.profit_since_payout:+,.2f}"
-            )
-            pnl_style = "green" if net >= 0 else "red"
-            self._log_activity(f"Trade closed: ${net:+,.2f} (day: ${acc.daily_pnl:+,.2f})", pnl_style)
+        if pnl is None:
+            return
 
-            # 180-minute cooldown after a losing trade
-            if net < 0:
-                acc.cooldown_until = self._now_et() + timedelta(minutes=180)
-                log.info(f"Loss cooldown: acct {acc_id} | no entries until {acc.cooldown_until.strftime('%H:%M')}")
-                self._log_activity(f"Cooldown until {acc.cooldown_until.strftime('%H:%M')} (180min)", "yellow")
+        # Exit trade with realized PnL
+        net = float(pnl) - fees
+        acc.daily_pnl += net
+        acc.profit_since_payout += net
+        acc.rt_trades_today.append(data)
+        acc._pending_exit_cooldown = False
+        acc._trade_active = False
+        log.info(
+            f"RT trade: acct {acc_id} | "
+            f"PnL=${float(pnl):+,.2f} fees=${fees:.2f} net=${net:+,.2f} | "
+            f"profit_since_payout=${acc.profit_since_payout:+,.2f}"
+        )
+        pnl_style = "green" if net >= 0 else "red"
+        self._log_activity(f"Trade closed: ${net:+,.2f} (day: ${acc.daily_pnl:+,.2f})", pnl_style)
 
-            # Update trade count
-            acc.trades_today = len([
-                t for t in acc.rt_trades_today
-                if t.get("profitAndLoss") is not None
-            ]) + (1 if acc.position != 0 else 0)
+        if net < 0:
+            acc.apply_loss_cooldown(self._now_et())
+            log.info(f"Loss cooldown: acct {acc_id} | no entries until {acc.cooldown_until.strftime('%H:%M')}")
+            self._log_activity(f"Cooldown until {acc.cooldown_until.strftime('%H:%M')} ({LOSS_COOLDOWN_MINUTES}min)", "yellow")
 
-            # Check trailing DD bust
-            drawdown = acc.peak - acc.equity
-            max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
-            if drawdown >= max_dd:
-                acc.active = False
-                log.warning(f"RT BUST detected: acct {acc_id} | DD ${drawdown:,.2f}")
+        # Update trade count
+        acc.trades_today = len([
+            t for t in acc.rt_trades_today if t.get("profitAndLoss") is not None
+        ]) + (1 if acc.position != 0 else 0)
+
+        # Check trailing DD bust
+        drawdown = acc.peak - acc.equity
+        max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
+        if drawdown >= max_dd:
+            acc.active = False
+            log.warning(f"RT BUST detected: acct {acc_id} | DD ${drawdown:,.2f}")
 
     def _on_rt_order(self, data: dict):
         """Handle real-time order status update. Capture stop order ID for trailing."""
@@ -1159,15 +1495,25 @@ class TradingEngine:
         if not acc_id or acc_id not in self.accounts:
             return
         acc = self.accounts[acc_id]
-        status = data.get("status", "")
         order_type = data.get("type", 0)
         order_id = data.get("id") or data.get("orderId")
-        log.debug(f"RT order: acct {acc_id} | id={order_id} type={order_type} status={status}")
+        log.debug(f"RT order: acct {acc_id} | id={order_id} type={order_type} status={data.get('status', '')}")
 
-        # Capture the stop bracket order ID so we can modify it for trailing
         if order_type == OrderType.STOP and order_id and acc.position != 0:
             acc.stop_order_id = int(order_id)
             log.info(f"Captured stop order ID: {order_id} for acct {acc_id}")
+
+    def _cancel_stale_orders(self, acc: AccountState):
+        """Cancel any remaining bracket orders after position goes flat."""
+        try:
+            orders = self.api.get_open_orders(acc.account_id)
+            for o in orders:
+                oid = int(o.get("id", o.get("orderId", 0)))
+                if oid:
+                    self.api.cancel_order(oid)
+                    log.info(f"Cancelled stale order {oid} (type={o.get('type')}) on acct {acc.account_id}")
+        except Exception as e:
+            log.warning(f"Failed to cancel stale orders on acct {acc.account_id}: {e}")
 
     def _on_rt_quote(self, data: dict):
         """Handle real-time market quote from GatewayQuote."""
@@ -1176,7 +1522,7 @@ class TradingEngine:
         if last_price is not None:
             self._last_price = float(last_price)
 
-    # ── State Persistence ─────────────────────────────────────────────
+    # -- State Persistence -------------------------------------------------
 
     def _load_state(self):
         if not os.path.exists(self.state_file):
@@ -1186,24 +1532,24 @@ class TradingEngine:
                 saved = json.load(f)
             for acc_id_str, data in saved.get("accounts", {}).items():
                 acc_id = int(acc_id_str)
-                if acc_id in self.accounts:
-                    acc = self.accounts[acc_id]
-                    acc.equity = data.get("equity", 0)
-                    acc.peak = data.get("peak", 0)
-                    acc.trading_days = data.get("trading_days", 0)
-                    acc.winning_days = data.get("winning_days", 0)
-                    acc.profit_since_payout = data.get("profit_since_payout", 0)
-                    acc.lifetime_extracted = data.get("lifetime_extracted", 0)
-                    acc.total_payouts = data.get("total_payouts", 0)
-                    acc.total_extracted = data.get("total_extracted", 0)
-                    acc.today = data.get("today", "")
-                    acc.daily_pnl = data.get("daily_pnl", 0)
-                    acc.trades_today = data.get("trades_today", 0)
-                    phase_str = data.get("phase", "eval")
-                    acc.phase = Phase(phase_str)
+                if acc_id not in self.accounts:
+                    continue
+                acc = self.accounts[acc_id]
+                acc.equity = data.get("equity", 0)
+                acc.peak = data.get("peak", 0)
+                acc.trading_days = data.get("trading_days", 0)
+                acc.winning_days = data.get("winning_days", 0)
+                acc.profit_since_payout = data.get("profit_since_payout", 0)
+                acc.lifetime_extracted = data.get("lifetime_extracted", 0)
+                acc.total_payouts = data.get("total_payouts", 0)
+                acc.total_extracted = data.get("total_extracted", 0)
+                acc.today = data.get("today", "")
+                acc.daily_pnl = data.get("daily_pnl", 0)
+                acc.trades_today = data.get("trades_today", 0)
+                acc.phase = Phase(data.get("phase", "eval"))
             log.info("Loaded saved state")
         except Exception as e:
-            log.warning(f"Could not load state: {e}")
+            log.warning(f"Could not load state: {e}", exc_info=True)
 
     def _save_state(self):
         data = {"accounts": {}}
@@ -1225,18 +1571,17 @@ class TradingEngine:
         with open(self.state_file, "w") as f:
             json.dump(data, f, indent=2)
 
-    # ── Time Helpers ──────────────────────────────────────────────────
+    # -- Time Helpers ------------------------------------------------------
 
     @staticmethod
     def _now_et() -> datetime:
         """Current time in US/Eastern."""
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/New_York"))
+        return datetime.now(ET)
 
     @staticmethod
     def _is_market_hours(dt_et: datetime) -> bool:
         """NQ futures: Sun 6pm - Fri 5pm ET, with daily halt 5pm-6pm ET."""
-        wd = dt_et.weekday()  # 0=Mon
+        wd = dt_et.weekday()
         mins = dt_et.hour * 60 + dt_et.minute
 
         if wd == 5:                          # Saturday: closed
@@ -1255,157 +1600,134 @@ class TradingEngine:
         mins = dt_et.hour * 60 + dt_et.minute
         return EVAL_CONFIG["session_start_min"] <= mins <= EVAL_CONFIG["session_end_min"]
 
-    @staticmethod
-    def _is_funded_entry_window(dt_et: datetime) -> bool:
-        """Alpha#44: enter at market open ~9:30-9:35 AM ET."""
-        mins = dt_et.hour * 60 + dt_et.minute
-        return 9 * 60 + 30 <= mins <= 9 * 60 + 35
-
-    @staticmethod
-    def _is_funded_exit_window(dt_et: datetime) -> bool:
-        """Alpha#44: exit at close ~3:55-4:00 PM ET."""
-        mins = dt_et.hour * 60 + dt_et.minute
-        return 15 * 60 + 55 <= mins <= 16 * 60
-
-    # ── API Sync (fallback when WebSocket is down) ──────────────────
+# -- API Sync (fallback when WebSocket is down) ------------------------
 
     def _sync_from_api(self, acc: AccountState):
-        """Full REST sync — used as fallback when WebSocket is unavailable."""
+        """Full REST sync -- used as fallback when WebSocket is unavailable."""
         try:
-            # Sync position from open positions
-            positions = self.api.get_positions(acc.account_id)
-            if positions:
-                nq_pos = None
-                for p in positions:
-                    if p.get("contractId") == acc.contract_id:
-                        nq_pos = p
-                        break
-                if nq_pos:
-                    size = int(nq_pos.get("size", 0))
-                    if acc.position == 0 and size != 0:
-                        log.warning(
-                            f"API sync: detected position {size} "
-                            f"but bot thinks flat — recovering bracket orders"
-                        )
-                        # Recover stop order ID so trailing logic works
-                        try:
-                            orders = self.api.get_open_orders(acc.account_id)
-                            for o in orders:
-                                if o.get("type") in (OrderType.STOP, OrderType.TRAILING_STOP):
-                                    acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
-                                    stop_px = o.get("stopPrice") or o.get("price")
-                                    if stop_px:
-                                        acc.stop_price = float(stop_px)
-                                    log.info(f"Recovered stop order {acc.stop_order_id} @ {acc.stop_price}")
-                                    break
-                            avg_px = nq_pos.get("averagePrice")
-                            if avg_px:
-                                acc.entry_price = float(avg_px)
-                                acc.highest_price_since_entry = acc.entry_price
-                        except Exception as e:
-                            log.error(f"Failed to recover bracket orders: {e}")
-                        self._log_activity(f"Recovered position: {size}x @ {acc.entry_price:.2f}", "yellow")
-                    acc.position = size
-                else:
-                    if acc.position != 0:
-                        log.warning(
-                            "API sync: no NQ position, syncing to flat"
-                        )
-                        # Position closed on exchange — set pending cooldown
-                        # so we wait for _on_rt_trade to confirm PnL
-                        acc._pending_exit_cooldown = True
-                        acc.last_exit_time = self._now_et()
-                    acc.position = 0
-                    acc.entry_price = 0.0
-            else:
-                if acc.position != 0:
-                    log.warning(
-                        "API sync: no positions, syncing to flat"
-                    )
-                    acc._pending_exit_cooldown = True
-                    acc.last_exit_time = self._now_et()
-                acc.position = 0
-                acc.entry_price = 0.0
-
-            # Sync equity from account balance
-            accounts = self.api.get_accounts()
-            for a in accounts:
-                if a.get("id") == acc.account_id:
-                    api_balance = a.get("balance")
-                    if api_balance is not None:
-                        bal = float(api_balance)
-                        acc.equity = bal - START_BALANCE
-                        acc.peak = max(acc.peak, acc.equity)
-                    break
-
-            # Sync daily PnL from trades (source of truth)
-            today_start = datetime.now(timezone.utc).strftime(
-                "%Y-%m-%dT00:00:00Z"
-            )
-            trades = self.api.get_trades(acc.account_id, today_start)
-            total_pnl = 0.0
-            total_fees = 0.0
-            trade_count = 0
-            for t in trades:
-                pnl = t.get("profitAndLoss")
-                if pnl is not None:
-                    total_pnl += float(pnl)
-                    trade_count += 1
-                total_fees += float(t.get("fees", 0))
-            acc.daily_pnl = total_pnl - total_fees
-            acc.trades_today = trade_count + (1 if acc.position != 0 else 0)
-            # Store trade data for dashboard
-            acc.rt_trades_today = [t for t in trades if t.get("profitAndLoss") is not None]
-
+            self._sync_position_from_api(acc)
+            self._sync_equity_from_api(acc)
+            self._sync_daily_pnl_from_api(acc)
         except Exception as e:
-            log.debug(f"API sync failed for acct {acc.account_id}: {e}")
+            log.debug(f"API sync failed for acct {acc.account_id}: {e}", exc_info=True)
 
-    # ── Daily Reset ───────────────────────────────────────────────────
+    def _sync_position_from_api(self, acc: AccountState):
+        """Sync position state from REST API."""
+        positions = self.api.get_positions(acc.account_id)
+        nq_pos = None
+        for p in (positions or []):
+            if p.get("contractId") == acc.contract_id:
+                nq_pos = p
+                break
+
+        if nq_pos:
+            size = int(nq_pos.get("size", 0))
+            if acc.position == 0 and size != 0:
+                log.warning(
+                    f"API sync: detected position {size} "
+                    f"but bot thinks flat -- recovering bracket orders"
+                )
+                self._recover_stop_order(acc, nq_pos)
+                self._log_activity(f"Recovered position: {size}x @ {acc.entry_price:.2f}", "yellow")
+            acc.position = size
+        else:
+            if acc.position != 0:
+                log.warning("API sync: no NQ position, syncing to flat")
+                acc._pending_exit_cooldown = True
+                acc.last_exit_time = self._now_et()
+            acc.position = 0
+            acc.entry_price = 0.0
+
+    def _recover_stop_order(self, acc: AccountState, nq_pos: dict):
+        """Try to recover the stop order ID and entry price after a reconnect."""
+        try:
+            orders = self.api.get_open_orders(acc.account_id)
+            for o in orders:
+                if o.get("type") in (OrderType.STOP, OrderType.TRAILING_STOP):
+                    acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
+                    stop_px = o.get("stopPrice") or o.get("price")
+                    if stop_px:
+                        acc.stop_price = float(stop_px)
+                    log.info(f"Recovered stop order {acc.stop_order_id} @ {acc.stop_price}")
+                    break
+            avg_px = nq_pos.get("averagePrice")
+            if avg_px:
+                acc.entry_price = float(avg_px)
+                acc.highest_price_since_entry = acc.entry_price
+        except Exception as e:
+            log.error(f"Failed to recover bracket orders: {e}", exc_info=True)
+
+    def _sync_equity_from_api(self, acc: AccountState):
+        """Sync equity from account balance."""
+        accounts = self.api.get_accounts()
+        for a in accounts:
+            if a.get("id") == acc.account_id:
+                api_balance = a.get("balance")
+                if api_balance is not None:
+                    bal = float(api_balance)
+                    acc.equity = bal - START_BALANCE
+                    acc.peak = max(acc.peak, acc.equity)
+                break
+
+    def _sync_daily_pnl_from_api(self, acc: AccountState):
+        """Sync daily PnL from trades (source of truth)."""
+        today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+        trades = self.api.get_trades(acc.account_id, today_start)
+        total_pnl = 0.0
+        total_fees = 0.0
+        trade_count = 0
+        for t in trades:
+            pnl = t.get("profitAndLoss")
+            if pnl is not None:
+                total_pnl += float(pnl)
+                trade_count += 1
+            total_fees += float(t.get("fees", 0))
+        acc.daily_pnl = total_pnl - total_fees
+        acc.trades_today = trade_count + (1 if acc.position != 0 else 0)
+        acc.rt_trades_today = [t for t in trades if t.get("profitAndLoss") is not None]
+
+    # -- Daily Reset -------------------------------------------------------
 
     def _check_new_day(self):
         """Reset daily state when the date rolls over."""
         today_str = str(self._now_et().date())
         for acc in self.accounts.values():
-            if acc.today != today_str:
-                if acc.today:  # not first run
-                    if acc.daily_pnl >= WINNING_DAY_THRESHOLD:
-                        acc.winning_days += 1
-                    acc.trading_days += 1
+            if acc.today == today_str:
+                continue
+            if acc.today:  # not first run
+                if acc.daily_pnl >= WINNING_DAY_THRESHOLD:
+                    acc.winning_days += 1
+                acc.trading_days += 1
 
-                acc.today = today_str
-                acc.daily_pnl = 0.0
-                acc.trades_today = 0
-                acc.entered_today = False
-                acc.rt_trades_today = []
-                acc.cooldown_until = None
-                acc.last_exit_time = None
-                # Reset day start balance for daily PnL tracking
-                if hasattr(acc, '_day_start_balance'):
-                    del acc._day_start_balance
-                log.info(f"Account {acc.account_id}: new day {today_str}")
+            acc.today = today_str
+            acc.daily_pnl = 0.0
+            acc.trades_today = 0
+            acc.rt_trades_today = []
+            acc.cooldown_until = None
+            acc.last_exit_time = None
+            if hasattr(acc, '_day_start_balance'):
+                del acc._day_start_balance
+            log.info(f"Account {acc.account_id}: new day {today_str}")
 
-    # ── Build Daily Bars for Alpha Signal ─────────────────────────────
+    # -- Build Daily Bars for Previous Day Close ----------------------------
 
     @staticmethod
     def _futures_session_date(dt: datetime) -> date:
-        """
-        Map a bar timestamp to the correct futures trading session date.
+        """Map a bar timestamp to the correct futures trading session date.
+
         NQ session: 6pm ET (prev day) -> 5pm ET (current day).
         Bars from 6pm-midnight belong to the NEXT calendar date's session.
         Bars from midnight-5pm belong to the current calendar date's session.
-        Bars from 5pm-6pm (halt) belong to the current calendar date's session.
         """
-        from zoneinfo import ZoneInfo
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        et = dt.astimezone(ZoneInfo("America/New_York"))
-        # If after 5:00 PM ET (17:00+), this bar belongs to tomorrow's session
-        if et.hour >= 17:
-            return (et + timedelta(days=1)).date()
-        return et.date()
+        et_dt = dt.astimezone(ET)
+        if et_dt.hour >= 17:
+            return (et_dt + timedelta(days=1)).date()
+        return et_dt.date()
 
     def _refresh_daily_bars(self):
-        """Fetch historical 5m bars and aggregate to daily OHLCV for alpha computation."""
+        """Fetch historical 5m bars and aggregate to daily OHLCV for prev-day close."""
         try:
             raw_bars = self.api.get_bars(
                 self.contract_id,
@@ -1420,7 +1742,6 @@ class TradingEngine:
             rows = []
             for b in raw_bars:
                 dt = pd.to_datetime(b["t"])
-                # Use UTC calendar date to match backtest (alpha_test_101.py load_daily)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 rows.append({
@@ -1434,7 +1755,6 @@ class TradingEngine:
                 })
 
             df = pd.DataFrame(rows).sort_values("datetime")
-
             daily = df.groupby("date").agg(
                 open=("open", "first"),
                 high=("high", "max"),
@@ -1446,15 +1766,14 @@ class TradingEngine:
             self._daily_bars = daily
             log.info(f"Refreshed daily bars: {len(daily)} days")
         except Exception as e:
-            log.error(f"Failed to refresh daily bars: {e}")
+            log.error(f"Failed to refresh daily bars: {e}", exc_info=True)
 
-    # ── Fetch Today's 5m Bars ─────────────────────────────────────────
+    # -- Fetch Today's 5m Bars ---------------------------------------------
 
     def _get_today_bars(self, now_et: datetime) -> List[Dict]:
         """Fetch today's 5m bars for VWAP calculation.
 
         Uses UTC calendar date to match backtest (lm.py trading_day = dt.date).
-        Fetches enough bars to cover a full day.
         """
         try:
             raw_bars = self.api.get_bars(
@@ -1477,14 +1796,23 @@ class TradingEngine:
 
             if not session_bars:
                 return []
-            # API returns bars in reverse chronological order — sort ascending
             session_bars.sort(key=lambda b: b.get("t", ""))
             return session_bars
         except Exception as e:
-            log.error(f"Failed to get today's bars: {e}")
+            log.error(f"Failed to get today's bars: {e}", exc_info=True)
             return []
 
-    # ── Core Trading Logic ────────────────────────────────────────────
+    # -- Prev Day Close (shared between strategy + dashboard) ---------------
+
+    def _get_prev_day_close(self) -> Optional[float]:
+        if self._daily_bars is not None and len(self._daily_bars) >= 2:
+            today_utc = datetime.now(timezone.utc).date()
+            prev_days = self._daily_bars[self._daily_bars["date"] < today_utc]
+            if not prev_days.empty:
+                return float(prev_days.iloc[-1]["close"])
+        return None
+
+    # -- Core Trading Logic ------------------------------------------------
 
     def _trade_eval(self, acc: AccountState):
         """VWAP Micro MR strategy for eval accounts."""
@@ -1496,13 +1824,21 @@ class TradingEngine:
             acc.bars_5m = bars
             acc.vwap = compute_vwap(bars)
 
+        # Use real-time price if available, fallback to bar close
+        current_price = getattr(self, '_last_price', None) or (_bar_close(bars[-1]) if bars else None)
+
+        # Trail the stop on every cycle when in a position (regardless of other guards)
+        if acc.position != 0 and current_price is not None:
+            self._trail_stop(acc, current_price)
+            return
+
         # Close position outside session window
         if not self._is_eval_session(now):
             if acc.position != 0:
                 self._close_position(acc, "session_end")
             return
 
-        # Daily loss limit — stop trading but don't bust
+        # Daily loss limit -- stop trading but don't bust
         if acc.daily_pnl <= -DAILY_LOSS_LIMIT:
             if acc.position != 0:
                 self._close_position(acc, "daily_loss_cap")
@@ -1511,8 +1847,7 @@ class TradingEngine:
         # Coast mode: reduce risk once profit_since_payout exceeds threshold
         coasting = acc.profit_since_payout >= COAST_THRESHOLD
 
-        # Daily profit cap — stop trading to protect gains
-        # Use tighter cap when coasting
+        # Daily profit cap
         if coasting:
             if acc.daily_pnl >= COAST_DAILY_CAP:
                 return
@@ -1521,123 +1856,37 @@ class TradingEngine:
             if max_daily and acc.daily_pnl >= max_daily:
                 return
 
-        # Max trades per day
         if acc.trades_today >= EVAL_CONFIG["max_trades_per_day"]:
             return
 
-        # PRIMARY GUARD: Block entries from order placement until RT trade confirms
-        # exit PnL. This is set locally in _open_position and cleared only by
-        # _on_rt_trade, so it's immune to WebSocket timing races.
-        if acc._trade_active:
-            # Safety release: if position is flat and no RT trade for 5 min,
-            # assume WebSocket missed it and apply a conservative cooldown
+        # Consolidated entry guard check
+        guard = acc.entry_blocked(now)
+
+        if guard == EntryGuard.TRADE_ACTIVE:
+            # Safety release: if position is flat and stuck for too long,
+            # assume WebSocket missed the trade event -- apply conservative cooldown
             if acc.position == 0 and acc.last_exit_time is not None:
                 stuck_seconds = (now - acc.last_exit_time).total_seconds()
-                if stuck_seconds > 300:
+                if stuck_seconds > STUCK_TRADE_TIMEOUT_SECS:
                     log.warning(
-                        f"_trade_active stuck for {stuck_seconds:.0f}s — "
-                        f"force-clearing with 180min cooldown"
+                        f"_trade_active stuck for {stuck_seconds:.0f}s -- "
+                        f"force-clearing with {LOSS_COOLDOWN_MINUTES}min cooldown"
                     )
                     acc._trade_active = False
                     acc._pending_exit_cooldown = False
-                    acc.cooldown_until = now + timedelta(minutes=180)
-            if acc._trade_active:
-                return
+                    acc.apply_loss_cooldown(now)
+                    # Re-check after clearing
+                    guard = acc.entry_blocked(now)
 
-        # Block entries until RT trade event confirms PnL after exchange exit
-        if getattr(acc, '_pending_exit_cooldown', False):
-            return
-
-        # Hard minimum 30s gap after any exit — prevents race conditions
-        # where entry fires before WebSocket events arrive
-        if acc.last_exit_time is not None:
-            seconds_since_exit = (now - acc.last_exit_time).total_seconds()
-            if seconds_since_exit < 30:
-                return
-
-        # 180-minute cooldown after a losing trade
-        if acc.cooldown_until is not None and now < acc.cooldown_until:
+        if guard != EntryGuard.CLEAR:
             return
 
         if not bars:
             return
 
-        # Use real-time price if available, fallback to bar close
-        current_price = getattr(self, '_last_price', None) or _bar_close(bars[-1])
+        prev_day_close = self._get_prev_day_close()
 
-        # If in position, ratchet trailing stop and modify the exchange stop order.
-        # Entry places a fixed 5pt stop. Once price moves enough, we tighten it
-        # by modifying the stop order on the exchange via Order/modify.
-        if acc.position != 0:
-            trail_pts = EVAL_CONFIG.get("trailing_stop_pts")
-            new_stop = None
-
-            if acc.position > 0:
-                # Only use real-time price — bar high/low can include
-                # prices from before entry (stale 5m bar data)
-                acc.highest_price_since_entry = max(acc.highest_price_since_entry, current_price)
-                if trail_pts is not None:
-                    trail_stop = acc.highest_price_since_entry - trail_pts
-                    if trail_stop > acc.stop_price:
-                        new_stop = trail_stop
-                        acc.stop_price = trail_stop
-            else:
-                acc.highest_price_since_entry = min(acc.highest_price_since_entry, current_price)
-                if trail_pts is not None:
-                    trail_stop = acc.highest_price_since_entry + trail_pts
-                    if trail_stop < acc.stop_price:
-                        new_stop = trail_stop
-                        acc.stop_price = trail_stop
-
-            # Modify the exchange stop order to match our tighter trailing stop
-            if new_stop is not None and acc.stop_order_id is not None:
-                try:
-                    self.api.modify_order(
-                        account_id=acc.account_id,
-                        order_id=acc.stop_order_id,
-                        stop_price=new_stop,
-                    )
-                    log.info(
-                        f"Trail stop moved on exchange: order {acc.stop_order_id} "
-                        f"-> {new_stop:.2f} (high={acc.highest_price_since_entry:.2f})"
-                    )
-                    self._log_activity(f"Stop moved -> {new_stop:.2f} (best: {acc.highest_price_since_entry:.2f})", "cyan")
-                except Exception as e:
-                    log.error(f"Failed to modify stop order: {e}")
-            elif new_stop is not None and acc.stop_order_id is None:
-                # Try to find the stop order ID from open orders
-                try:
-                    orders = self.api.get_open_orders(acc.account_id)
-                    for o in orders:
-                        if o.get("type") == OrderType.STOP:
-                            acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
-                            self.api.modify_order(
-                                account_id=acc.account_id,
-                                order_id=acc.stop_order_id,
-                                stop_price=new_stop,
-                            )
-                            log.info(
-                                f"Found & moved stop order {acc.stop_order_id} "
-                                f"-> {new_stop:.2f}"
-                            )
-                            break
-                except Exception as e:
-                    log.error(f"Failed to find/modify stop order: {e}")
-
-            # Exchange handles the actual exit via bracket orders + WebSocket
-            return
-
-        # Get previous day's close for day bias filter (matches backtest)
-        prev_day_close = None
-        if self._daily_bars is not None and len(self._daily_bars) >= 2:
-            today_utc = datetime.now(timezone.utc).date()
-            prev_days = self._daily_bars[self._daily_bars["date"] < today_utc]
-            if not prev_days.empty:
-                prev_day_close = float(prev_days.iloc[-1]["close"])
-
-        # Check for new entry — long on bullish days, short on bearish days
-        # Fixed 5pt stop bracket on the exchange as worst-case protection.
-        # Local trailing stop (2pt) tightens it once price moves 3+ pts in our favor.
+        # Check for new entry
         stop_ticks = pts_to_ticks(EVAL_CONFIG["stop_pts"])
         target_ticks = pts_to_ticks(EVAL_CONFIG["target_pts"])
         qty = COAST_CONTRACTS if coasting else EVAL_CONFIG["contracts"]
@@ -1670,42 +1919,175 @@ class TradingEngine:
                 target_ticks=-target_ticks,
             )
 
-    def _trade_funded(self, acc: AccountState):
-        """Alpha#44 strategy for funded accounts."""
-        now = self._now_et()
+    def _trail_stop(self, acc: AccountState, current_price: float):
+        """Ratchet the trailing stop and modify the exchange stop order.
 
-        # Daily loss limit — stop trading but don't bust
+        Called on every poll cycle when in a position. Entry places a fixed 5pt stop.
+        Once price moves enough, we tighten it by modifying the stop on the exchange.
+        """
+        trail_pts = EVAL_CONFIG.get("trailing_stop_pts")
+        new_stop = None
+
+        if acc.position > 0:
+            acc.highest_price_since_entry = max(acc.highest_price_since_entry, current_price)
+            if trail_pts is not None:
+                trail_stop = round(round((acc.highest_price_since_entry - trail_pts) / TICK_SIZE) * TICK_SIZE, 2)
+                if trail_stop > acc.stop_price:
+                    new_stop = trail_stop
+                    acc.stop_price = trail_stop
+        else:
+            acc.highest_price_since_entry = min(acc.highest_price_since_entry, current_price)
+            if trail_pts is not None:
+                trail_stop = round(round((acc.highest_price_since_entry + trail_pts) / TICK_SIZE) * TICK_SIZE, 2)
+                if trail_stop < acc.stop_price:
+                    new_stop = trail_stop
+                    acc.stop_price = trail_stop
+
+        if new_stop is None:
+            return
+
+        if acc.stop_order_id is not None:
+            self._modify_stop_on_exchange(acc, new_stop)
+        else:
+            self._find_and_modify_stop(acc, new_stop)
+
+    def _modify_stop_on_exchange(self, acc: AccountState, new_stop: float):
+        """Modify a known stop order to a new price."""
+        try:
+            self.api.modify_order(
+                account_id=acc.account_id,
+                order_id=acc.stop_order_id,
+                stop_price=new_stop,
+            )
+            log.info(
+                f"Trail stop moved on exchange: order {acc.stop_order_id} "
+                f"-> {new_stop:.2f} (high={acc.highest_price_since_entry:.2f})"
+            )
+            self._log_activity(f"Stop moved -> {new_stop:.2f} (best: {acc.highest_price_since_entry:.2f})", "cyan")
+        except Exception as e:
+            log.error(f"Failed to modify stop order: {e}", exc_info=True)
+
+    def _find_and_modify_stop(self, acc: AccountState, new_stop: float):
+        """Find the stop order ID from open orders and modify it."""
+        try:
+            orders = self.api.get_open_orders(acc.account_id)
+            for o in orders:
+                if o.get("type") == OrderType.STOP:
+                    acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
+                    self.api.modify_order(
+                        account_id=acc.account_id,
+                        order_id=acc.stop_order_id,
+                        stop_price=new_stop,
+                    )
+                    log.info(f"Found & moved stop order {acc.stop_order_id} -> {new_stop:.2f}")
+                    break
+        except Exception as e:
+            log.error(f"Failed to find/modify stop order: {e}", exc_info=True)
+
+    def _trade_funded(self, acc: AccountState):
+        """VWAP Micro MR strategy for funded accounts with coast mode."""
+        now = self._now_et()
+        cfg = FUNDED_CONFIG
+
+        # Always fetch bars so dashboard has data even outside session
+        bars = self._get_today_bars(now)
+        if bars:
+            acc.bars_5m = bars
+            acc.vwap = compute_vwap(bars)
+
+        current_price = getattr(self, '_last_price', None) or (_bar_close(bars[-1]) if bars else None)
+
+        # Trail the stop on every cycle when in a position
+        if acc.position != 0 and current_price is not None:
+            self._trail_stop(acc, current_price)
+            return
+
+        # Close position outside session window
+        in_session = self._is_eval_session(now)  # same session hours
+        if not in_session:
+            if acc.position != 0:
+                self._close_position(acc, "session_end")
+            return
+
+        # Daily loss limit
         if acc.daily_pnl <= -DAILY_LOSS_LIMIT:
             if acc.position != 0:
                 self._close_position(acc, "daily_loss_cap")
             return
 
-        # Compute alpha signal once per day
-        if not acc.entered_today and len(self._daily_bars) > 0:
-            acc.alpha_signal = compute_alpha044(self._daily_bars)
-            acc.alpha_direction = "LONG" if acc.alpha_signal > 0 else "FLAT"
+        # Coast mode: once profit_since_payout exceeds threshold, reduce risk
+        coasting = acc.profit_since_payout >= COAST_THRESHOLD
 
-        # Entry: at open 9:30 if signal is LONG
-        if (acc.position == 0
-                and acc.alpha_direction == "LONG"
-                and not acc.entered_today
-                and self._is_funded_entry_window(now)):
-            bars = self._get_today_bars(now)
-            if bars:
-                price = _bar_close(bars[-1])
-                self._open_position(
-                    acc,
-                    side=OrderSide.BID,
-                    contracts=FUNDED_CONFIG["contracts"],
-                    entry_price=price,
-                )
-                acc.entered_today = True
+        # Daily profit cap
+        if coasting:
+            if acc.daily_pnl >= COAST_DAILY_CAP:
+                return
+        else:
+            max_daily = cfg.get("max_daily_pnl")
+            if max_daily and acc.daily_pnl >= max_daily:
+                return
 
-        # Exit: at close ~3:55 PM
-        if acc.position != 0 and self._is_funded_exit_window(now):
-            self._close_position(acc, "eod_exit")
+        if acc.trades_today >= cfg["max_trades_per_day"]:
+            return
 
-    # ── Order Execution ───────────────────────────────────────────────
+        # Consolidated entry guard check
+        guard = acc.entry_blocked(now)
+
+        if guard == EntryGuard.TRADE_ACTIVE:
+            if acc.position == 0 and acc.last_exit_time is not None:
+                stuck_seconds = (now - acc.last_exit_time).total_seconds()
+                if stuck_seconds > STUCK_TRADE_TIMEOUT_SECS:
+                    log.warning(
+                        f"_trade_active stuck for {stuck_seconds:.0f}s -- "
+                        f"force-clearing with {LOSS_COOLDOWN_MINUTES}min cooldown"
+                    )
+                    acc._trade_active = False
+                    acc._pending_exit_cooldown = False
+                    acc.apply_loss_cooldown(now)
+                    guard = acc.entry_blocked(now)
+
+        if guard != EntryGuard.CLEAR:
+            return
+
+        if not bars:
+            return
+
+        prev_day_close = self._get_prev_day_close()
+
+        # Check for new entry
+        stop_ticks = pts_to_ticks(cfg["stop_pts"])
+        target_ticks = pts_to_ticks(cfg["target_pts"])
+        qty = COAST_CONTRACTS if coasting else cfg["contracts"]
+
+        if check_vwap_mr_entry(bars, cfg, prev_day_close=prev_day_close):
+            if coasting:
+                log.info(f"COAST MODE (funded): acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
+            self._open_position(
+                acc,
+                side=OrderSide.BID,
+                contracts=qty,
+                entry_price=current_price,
+                stop_pts=cfg["stop_pts"],
+                target_pts=cfg["target_pts"],
+                stop_ticks=-stop_ticks,
+                target_ticks=target_ticks,
+            )
+        elif (not cfg.get("long_only", True)
+              and check_vwap_mr_short_entry(bars, cfg, prev_day_close=prev_day_close)):
+            if coasting:
+                log.info(f"COAST MODE (funded): acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
+            self._open_position(
+                acc,
+                side=OrderSide.ASK,
+                contracts=qty,
+                entry_price=current_price,
+                stop_pts=cfg["stop_pts"],
+                target_pts=cfg["target_pts"],
+                stop_ticks=stop_ticks,
+                target_ticks=-target_ticks,
+            )
+
+    # -- Order Execution ---------------------------------------------------
 
     def _open_position(
         self,
@@ -1719,13 +2101,9 @@ class TradingEngine:
         target_ticks: Optional[int] = None,
         trailing_stop: bool = False,
     ):
-        """Open a position via market order with optional brackets.
-
-        If trailing_stop=True, the stop loss bracket uses TrailingStop type (5)
-        so the exchange automatically trails the stop for us.
-        """
+        """Open a position via market order with optional brackets."""
         try:
-            result = self.api.place_market_order(
+            self.api.place_market_order(
                 account_id=acc.account_id,
                 contract_id=acc.contract_id,
                 side=side,
@@ -1736,17 +2114,33 @@ class TradingEngine:
             )
 
             acc.position = contracts if side == OrderSide.BID else -contracts
-            acc._trade_active = True  # Block new entries until RT trade confirms exit
-            acc._last_entry_time = self._now_et()
+            acc._trade_active = True
             acc.entry_price = entry_price
-            if side == OrderSide.BID:  # long
+            if side == OrderSide.BID:
                 acc.stop_price = entry_price - stop_pts if stop_pts else 0.0
                 acc.target_price = entry_price + target_pts if target_pts else 999999.0
-            else:  # short
+            else:
                 acc.stop_price = entry_price + stop_pts if stop_pts else 999999.0
                 acc.target_price = entry_price - target_pts if target_pts else 0.0
             acc.highest_price_since_entry = entry_price
             acc.trades_today += 1
+
+            # Retry up to 3 times to capture stop order ID for trailing stop
+            for attempt in range(1, 4):
+                try:
+                    time.sleep(0.5 * attempt)  # 0.5s, 1s, 1.5s
+                    orders = self.api.get_open_orders(acc.account_id)
+                    for o in orders:
+                        if o.get("type") == OrderType.STOP:
+                            acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
+                            log.info(f"Captured stop order ID on attempt {attempt}: {acc.stop_order_id}")
+                            break
+                    if acc.stop_order_id is not None:
+                        break
+                except Exception as e:
+                    log.warning(f"Stop order ID fetch attempt {attempt}/3 failed: {e}")
+            if acc.stop_order_id is None:
+                log.warning(f"Could not capture stop order ID after 3 attempts -- trailing will search each cycle")
 
             trail_str = " [TRAILING]" if trailing_stop else ""
             side_str = "BUY" if side == OrderSide.BID else "SELL"
@@ -1759,7 +2153,7 @@ class TradingEngine:
                 "green" if side == OrderSide.BID else "red"
             )
         except Exception as e:
-            log.error(f"Order failed on acct {acc.account_id}: {e}")
+            log.error(f"Order failed on acct {acc.account_id}: {e}", exc_info=True)
             self._log_activity(f"Order FAILED: {e}", "red")
             acc.last_error = str(e)
 
@@ -1780,18 +2174,11 @@ class TradingEngine:
                 size=contracts,
             )
 
-            log.info(
-                f"CLOSED: Acct {acc.account_id} | {reason} | "
-                f"{side_str} {contracts}x NQ"
-            )
+            log.info(f"CLOSED: Acct {acc.account_id} | {reason} | {side_str} {contracts}x NQ")
             self._log_activity(f"Position closed: {reason} ({side_str} {contracts}x)", "yellow")
 
             acc.position = 0
-            acc.entry_price = 0.0
-            acc.stop_price = 0.0
-            acc.highest_price_since_entry = 0.0
-            acc.target_price = 0.0
-            acc.stop_order_id = None
+            acc.clear_position_state()
             acc.last_exit_time = self._now_et()
 
             # Check trailing DD bust
@@ -1808,307 +2195,34 @@ class TradingEngine:
                 log.info(f"EVAL PASSED: Acct {acc.account_id} | Equity=${acc.equity:,.2f}")
 
         except Exception as e:
-            log.error(f"Close failed on acct {acc.account_id}: {e}")
+            log.error(f"Close failed on acct {acc.account_id}: {e}", exc_info=True)
             acc.last_error = str(e)
 
-    # ── Dashboard ─────────────────────────────────────────────────────
-
-    def _build_dashboard(self) -> Table:
-        """Build rich dashboard as a single table with market conditions."""
-        from rich.columns import Columns
-        from rich.layout import Layout
-
-        now = self._now_et()
-        market_open = self._is_market_hours(now)
-        in_session = self._is_eval_session(now)
-        mins = now.hour * 60 + now.minute
-
-        # ── Market conditions from latest bars ──
-        price_str = "-"
-        vwap_str = "-"
-        dip_str = "-"
-        rsi_str = "-"
-        bias_str = "-"
-        entry_str = "[dim]NO[/]"
-        dist_str = "-"
-
-        # Grab from first active eval account
-        for acc in self.accounts.values():
-            if acc.bars_5m:
-                price = _bar_close(acc.bars_5m[-1])
-                vwap = acc.vwap
-                price_str = f"{price:,.2f}"
-                vwap_str = f"{vwap:,.2f}"
-
-                if vwap > 0:
-                    dip = vwap - price
-                    dip_color = "green" if dip >= 2.5 else "red"
-                    dip_str = f"[{dip_color}]{dip:+.2f} pts[/]"
-
-                    # Distance to entry: how much price must drop to reach VWAP - 2.5
-                    entry_level = vwap - EVAL_CONFIG["min_dip_pts"]
-                    distance = price - entry_level
-                    if distance > 0:
-                        dist_str = f"[yellow]{distance:.2f} pts above[/] ({entry_level:,.2f})"
-                    else:
-                        dist_str = f"[green]IN ZONE[/] ({abs(distance):.2f} below)"
-
-                closes = [_bar_close(b) for b in acc.bars_5m]
-                rsi = compute_rsi(closes, 14)
-                rsi_color = "green" if rsi < 45 else "red"
-                rsi_str = f"[{rsi_color}]{rsi:.1f}[/]"
-
-                # Day bias: gap + first window move (matches backtest)
-                bias = _compute_day_bias(acc.bars_5m, EVAL_CONFIG)
-                prev_day_close = None
-                if self._daily_bars is not None and len(self._daily_bars) >= 2:
-                    today_utc = datetime.now(timezone.utc).date()
-                    prev_days = self._daily_bars[self._daily_bars["date"] < today_utc]
-                    if not prev_days.empty:
-                        prev_day_close = float(prev_days.iloc[-1]["close"])
-
-                if EVAL_CONFIG.get("day_bias_filter", False):
-                    gap = None
-                    if bias["session_open"] is not None and prev_day_close is not None:
-                        gap = bias["session_open"] - prev_day_close
-                    min_gap = EVAL_CONFIG.get("day_bias_min_gap_pts", 3.0)
-                    min_fw = EVAL_CONFIG.get("day_bias_min_first_window_move_pts", 0.0)
-                    gap_bull = gap is not None and gap >= min_gap
-                    fw_bull = bias["first_window_move"] is not None and bias["first_window_move"] >= min_fw
-                    gap_bear = gap is not None and gap <= -min_gap
-                    fw_bear = bias["first_window_move"] is not None and bias["first_window_move"] <= -min_fw
-                    if gap_bull and fw_bull:
-                        bias_str = f"[green]BULL[/] (gap {gap:+.1f})"
-                    elif gap_bear and fw_bear:
-                        bias_str = f"[yellow]BEAR[/] (gap {gap:+.1f})"
-                    elif gap is not None:
-                        bias_str = f"[red]FLAT[/] (gap {gap:+.1f})"
-                    else:
-                        bias_str = "[dim]N/A[/]"
-                else:
-                    bias_str = "[green]ANY[/] (no bias filter)"
-
-                # Check all conditions — long or short
-                long_met = check_vwap_mr_entry(acc.bars_5m, EVAL_CONFIG, prev_day_close=prev_day_close)
-                short_met = (not EVAL_CONFIG.get("long_only", True)
-                             and check_vwap_mr_short_entry(acc.bars_5m, EVAL_CONFIG, prev_day_close=prev_day_close))
-                if long_met:
-                    entry_str = "[bold green]LONG[/]"
-                elif short_met:
-                    entry_str = "[bold yellow]SHORT[/]"
-                else:
-                    entry_str = "[dim]NO[/]"
-                break
-
-        # ── Build output ──
-        outer = Table.grid(padding=(0, 0))
-
-        # Header row
-        market_str = "[bold green]OPEN[/]" if market_open else "[bold red]CLOSED[/]"
-        session_str = "[green]IN SESSION[/]" if in_session else "[dim]OUT[/]"
-        # Position indicator from first account
-        pos_str = "[dim]FLAT[/]"
-        for acc in self.accounts.values():
-            if acc.position > 0:
-                pos_str = f"[bold green]{acc.position}x LONG @ {acc.entry_price:,.2f}[/]"
-            elif acc.position < 0:
-                pos_str = f"[bold red]{abs(acc.position)}x SHORT @ {acc.entry_price:,.2f}[/]"
-            break
-
-        rt_str = "[green]WS[/]" if self._rt_connected else "[red]REST[/]"
-        rt_price = getattr(self, '_last_price', None)
-        rt_price_str = f"  |  RT: ${rt_price:,.2f}" if rt_price else ""
-        header = Text.from_markup(
-            f" [bold]TopstepX Bot[/]  |  {now.strftime('%Y-%m-%d %H:%M:%S ET')}  |  "
-            f"Market: {market_str}  |  Session: {session_str}  |  "
-            f"Position: {pos_str}  |  {self.contract_name}  |  "
-            f"Feed: {rt_str}{rt_price_str}"
-        )
-        outer.add_row(header)
-        outer.add_row(Text(""))
-
-        # Market conditions panel
-        cond = Table.grid(padding=(0, 4))
-        cond.add_column(style="bold", width=16)
-        cond.add_column(width=24)
-        cond.add_column(style="bold", width=16)
-        cond.add_column(width=24)
-        cond.add_row("Price:", price_str, "VWAP:", vwap_str)
-        cond.add_row("Dip from VWAP:", dip_str, "RSI(14):", rsi_str)
-        cond.add_row("Day Bias:", bias_str, "Entry Signal:", entry_str)
-        cond.add_row("Dist to Entry:", dist_str, "", "")
-
-        outer.add_row(Panel(cond, title="Market Conditions", border_style="cyan", expand=True))
-        outer.add_row(Text(""))
-
-        # Accounts table
-        acct_table = Table(show_lines=True, expand=True, show_header=True, padding=(0, 2))
-        acct_table.add_column("Account", style="bold", ratio=4, no_wrap=True)
-        acct_table.add_column("Phase", justify="center", ratio=1)
-        acct_table.add_column("Equity", justify="right", ratio=2)
-        acct_table.add_column("DD Left", justify="right", ratio=2)
-        acct_table.add_column("Day PnL", justify="right", ratio=2)
-        acct_table.add_column("Position", justify="center", ratio=2)
-        acct_table.add_column("Trades", justify="center", ratio=1)
-        acct_table.add_column("Status", justify="center", ratio=2)
-
-        for acc in self.accounts.values():
-            max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
-            dd_left = max_dd - (acc.peak - acc.equity)
-
-            phase_text = Text(acc.phase.value.upper())
-            phase_text.stylize("green" if acc.phase == Phase.EVAL else "blue")
-
-            equity_text = Text(f"${acc.equity:,.2f}")
-            equity_text.stylize("green" if acc.equity >= 0 else "red")
-
-            dd_text = Text(f"${dd_left:,.2f}")
-            dd_text.stylize("green" if dd_left > 500 else "yellow" if dd_left > 200 else "red")
-
-            day_text = Text(f"${acc.daily_pnl:+,.2f}")
-            day_text.stylize("green" if acc.daily_pnl >= 0 else "red")
-
-            pos = f"{acc.position}x LONG" if acc.position > 0 else f"{abs(acc.position)}x SHORT" if acc.position < 0 else "flat"
-            pos_text = Text(pos)
-            pos_text.stylize("cyan" if acc.position != 0 else "dim")
-
-            if not acc.active:
-                status = Text("BUST", style="bold red")
-            elif acc.phase == Phase.EVAL and acc.equity >= EVAL_PROFIT_TARGET:
-                status = Text("PASSED!", style="bold green")
-            elif acc.position != 0:
-                cur_px = _bar_close(acc.bars_5m[-1]) if acc.bars_5m else acc.entry_price
-                unrealized = (cur_px - acc.entry_price) * POINT_VALUE * acc.position
-                ucolor = "green" if unrealized >= 0 else "red"
-                status = Text(f"OPEN ${unrealized:+,.0f}", style=f"bold {ucolor}")
-            elif not market_open:
-                status = Text("MKT CLOSED", style="dim")
-            elif not in_session and acc.phase == Phase.EVAL:
-                status = Text("WAIT SESSION", style="dim")
-            else:
-                status = Text("SCANNING", style="yellow")
-
-            # Funded extra row info
-            extra = ""
-            if acc.phase == Phase.FUNDED:
-                extra = f"\nW-days: {acc.winning_days}/{WINNING_DAYS_REQUIRED} | Extracted: ${acc.total_extracted:,.0f}"
-
-            acct_table.add_row(
-                f"{acc.name} ({acc.account_id}){extra}",
-                phase_text,
-                equity_text,
-                dd_text,
-                day_text,
-                pos_text,
-                f"{acc.trades_today}/{EVAL_CONFIG['max_trades_per_day']}",
-                status,
-            )
-
-        outer.add_row(acct_table)
-        outer.add_row(Text(""))
-
-        # Trade history from real-time data (no REST call needed)
-        for acc in self.accounts.values():
-            exit_trades = acc.rt_trades_today
-            if exit_trades:
-                trade_table = Table(
-                    show_lines=False, expand=True,
-                    title="Today's Trades (live)",
-                    title_style="bold cyan",
-                )
-                trade_table.add_column("Time (ET)", ratio=2)
-                trade_table.add_column("Side", justify="center", ratio=1)
-                trade_table.add_column("Size", justify="center", ratio=1)
-                trade_table.add_column("Price", justify="right", ratio=2)
-                trade_table.add_column("PnL", justify="right", ratio=2)
-                trade_table.add_column("Fees", justify="right", ratio=1)
-
-                from zoneinfo import ZoneInfo
-                et = ZoneInfo("America/New_York")
-                for t in exit_trades:
-                    ts_raw = t.get("creationTimestamp") or t.get("timestamp", "")
-                    try:
-                        ts = pd.to_datetime(ts_raw)
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=timezone.utc)
-                        ts_et = ts.astimezone(et)
-                        time_str = ts_et.strftime("%H:%M:%S")
-                    except Exception:
-                        time_str = "?"
-                    # RT trade events report the EXIT side — flip to show entry side
-                    side_str = "SELL" if t.get("side") == 0 else "BUY"
-                    side_style = "green" if t.get("side") == 1 else "red"
-                    price_str = f"{float(t.get('price', 0)):,.2f}"
-                    pnl = float(t.get("profitAndLoss", 0))
-                    fees = float(t.get("fees", 0))
-                    net = pnl - fees
-                    net_style = "green" if net >= 0 else "red"
-                    trade_table.add_row(
-                        time_str,
-                        f"[{side_style}]{side_str}[/]",
-                        str(t.get("size", "")),
-                        price_str,
-                        f"[{net_style}]${pnl:+,.2f}[/]",
-                        f"${fees:.2f}",
-                    )
-                # Summary row
-                total_pnl = sum(float(t.get("profitAndLoss", 0)) for t in exit_trades)
-                total_fees = sum(float(t.get("fees", 0)) for t in exit_trades)
-                net_total = total_pnl - total_fees
-                ns = "green" if net_total >= 0 else "red"
-                trade_table.add_row(
-                    "[bold]TOTAL[/]", "", "", "",
-                    f"[bold {ns}]${net_total:+,.2f}[/]",
-                    f"${total_fees:.2f}",
-                )
-
-                outer.add_row(trade_table)
-            break  # only first account
-
-        # Activity log panel
-        if self._activity_log:
-            outer.add_row(Text(""))
-            log_table = Table(
-                show_lines=False, expand=True,
-                title="Activity Log",
-                title_style="bold cyan",
-                show_header=False,
-            )
-            log_table.add_column("Time", width=10, style="dim")
-            log_table.add_column("Event", ratio=1)
-            for ts, msg, style in reversed(self._activity_log):
-                log_table.add_row(ts, f"[{style}]{msg}[/]" if style else msg)
-            outer.add_row(log_table)
-
-        return outer
-
-    # ── Main Loop ─────────────────────────────────────────────────────
+    # -- Main Loop ---------------------------------------------------------
 
     def run(self):
-        """Main trading loop — runs 24/7."""
+        """Main trading loop -- runs 24/7."""
         self.running = True
-        log.info("Bot started — running 24/7")
+        log.info("Bot started -- running 24/7")
 
         self._refresh_daily_bars()
         last_daily_refresh = time.time()
         last_rest_sync = 0.0
         last_dashboard_update = 0.0
-        REST_SYNC_INTERVAL = 60  # REST fallback every 60s (vs 5s before)
+        REST_SYNC_INTERVAL = 60
 
         try:
-            with Live(self._build_dashboard(), console=console, refresh_per_second=0.5, vertical_overflow="crop") as live:
+            with Live(self._dashboard.build(), console=console, refresh_per_second=0.5, vertical_overflow="crop") as live:
                 while self.running:
                     try:
                         now = self._now_et()
                         market_open = self._is_market_hours(now)
                         self._check_new_day()
 
-                        # Refresh daily bars every 30 min
                         if time.time() - last_daily_refresh > 1800:
                             self._refresh_daily_bars()
                             last_daily_refresh = time.time()
 
-                        # Re-auth if needed
                         self.api.ensure_auth()
 
                         if market_open:
@@ -2121,19 +2235,17 @@ class TradingEngine:
                                     else:
                                         self._trade_funded(acc)
                                 except Exception as e:
-                                    log.error(f"Trade error on acct {acc.account_id}: {e}")
+                                    log.error(f"Trade error on acct {acc.account_id}: {e}", exc_info=True)
                                     acc.last_error = str(e)
 
-                        # REST sync as fallback — infrequent since WebSocket handles updates
                         if time.time() - last_rest_sync > REST_SYNC_INTERVAL:
                             for acc in self.accounts.values():
                                 self._sync_from_api(acc)
                             last_rest_sync = time.time()
 
-                        # Update dashboard: every 5s during market, every 30s outside
                         dash_interval = self.POLL_INTERVAL if market_open else 30
                         if time.time() - last_dashboard_update >= dash_interval:
-                            live.update(self._build_dashboard())
+                            live.update(self._dashboard.build())
                             last_dashboard_update = time.time()
 
                         self._save_state()
@@ -2151,7 +2263,6 @@ class TradingEngine:
                 self._rt.stop()
             for acc in self.accounts.values():
                 if acc.position != 0:
-                    # Check if bracket orders (SL/TP) are on the exchange
                     has_brackets = False
                     try:
                         orders = self.api.get_open_orders(acc.account_id)
@@ -2160,19 +2271,17 @@ class TradingEngine:
                     except Exception:
                         pass
                     if has_brackets:
-                        log.info(
-                            f"Acct {acc.account_id}: position open with bracket orders on exchange — leaving as-is"
-                        )
+                        log.info(f"Acct {acc.account_id}: position open with bracket orders on exchange -- leaving as-is")
                     else:
-                        log.info(f"Acct {acc.account_id}: no brackets found — closing position")
+                        log.info(f"Acct {acc.account_id}: no brackets found -- closing position")
                         self._close_position(acc, "shutdown")
             self._save_state()
             log.info("Bot stopped.")
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 # Entry Point
-# ═════════════════════════════════════════════════════════════════════════
+# =========================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2191,7 +2300,6 @@ Reads API_KEY from .env file (or --config / TOPSTEPX_API_KEY env var).
     parser.add_argument("--poll", type=int, default=5, help="Poll interval in seconds (default: 5)")
     args = parser.parse_args()
 
-    # Load API key: .env > config.json > env var
     api_key = os.environ.get("API_KEY") or os.environ.get("TOPSTEPX_API_KEY")
     username = os.environ.get("TOPSTEPX_USERNAME", "")
     account_phases = {}
@@ -2211,7 +2319,6 @@ Reads API_KEY from .env file (or --config / TOPSTEPX_API_KEY env var).
         console.print("  2. Generate API key")
         sys.exit(1)
 
-    # Build and run
     api = ProjectXAPI(api_key, username)
     engine = TradingEngine(api)
     engine.POLL_INTERVAL = args.poll
@@ -2220,7 +2327,7 @@ Reads API_KEY from .env file (or --config / TOPSTEPX_API_KEY env var).
         "[bold]TopstepX Automated Trading Bot[/]\n\n"
         f"Eval:   VWAP Micro Mean-Reversion ({EVAL_CONFIG['session_start_min']//60}:{EVAL_CONFIG['session_start_min']%60:02d}"
         f"-{EVAL_CONFIG['session_end_min']//60}:{EVAL_CONFIG['session_end_min']%60:02d} ET)\n"
-        "Funded: Alpha#44 (long at open, exit at close)\n\n"
+        "Funded: VWAP MR with coast mode (same strategy, reduced risk)\n\n"
         "Data feed: SignalR WebSocket (real-time) + REST fallback\n"
         f"Poll interval: {args.poll}s\n"
         "Press Ctrl+C to stop (positions closed safely)",
@@ -2230,14 +2337,11 @@ Reads API_KEY from .env file (or --config / TOPSTEPX_API_KEY env var).
 
     try:
         engine.setup()
-
-        # Override phases from config
         for acc_id_str, acc_cfg in account_phases.items():
             acc_id = int(acc_id_str)
             if acc_id in engine.accounts:
                 engine.accounts[acc_id].phase = Phase(acc_cfg.get("phase", "eval"))
                 log.info(f"Config override: acct {acc_id} ->{acc_cfg.get('phase')}")
-
         engine.run()
     except Exception as e:
         log.error(f"Fatal error: {e}\n{traceback.format_exc()}")
