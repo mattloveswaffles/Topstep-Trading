@@ -48,7 +48,7 @@ from rich.text import Text
 
 load_dotenv()
 
-console = Console()
+console = Console(width=140)
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -99,14 +99,53 @@ PAYOUT_BAL_PCT = 0.50
 WINNING_DAY_THRESHOLD = 150.0
 WINNING_DAYS_REQUIRED = 5
 
+# -- Session Definitions (ET) ---------------------------------------------
+# Each session: (name, start_min, end_min)
+# Topstep "day" starts at Asia open (6PM ET)
+SESSIONS = [
+    ("Asia",   18 * 60,       2 * 60),       # 6:00 PM - 2:00 AM ET (wraps midnight)
+    ("London",  3 * 60,       9 * 60 + 30),  # 3:00 AM - 9:30 AM ET
+    ("NY",      9 * 60 + 30, 15 * 60 + 45),  # 9:30 AM - 3:45 PM ET
+]
+
+
+def _is_market_open(dt_et: datetime) -> bool:
+    """NQ futures: Sun 6pm - Fri 5pm ET, with daily halt 5pm-6pm ET."""
+    wd = dt_et.weekday()
+    mins = dt_et.hour * 60 + dt_et.minute
+    if wd == 5:                          # Saturday: closed
+        return False
+    if wd == 6:                          # Sunday: open from 6pm
+        return mins >= 18 * 60
+    if wd == 4 and mins >= 17 * 60:      # Friday: close at 5pm
+        return False
+    if 17 * 60 <= mins < 18 * 60:        # Mon-Thu: halt 5-6pm
+        return False
+    return True
+
+
+def get_current_session(dt_et: datetime) -> Optional[str]:
+    """Return the name of the active session, or None if between sessions or market closed."""
+    if not _is_market_open(dt_et):
+        return None
+    mins = dt_et.hour * 60 + dt_et.minute
+    for name, start, end in SESSIONS:
+        if start <= end:
+            if start <= mins <= end:
+                return name
+        else:
+            # Overnight wrap (e.g. Asia 6PM-2AM)
+            if mins >= start or mins <= end:
+                return name
+    return None
+
+
 # -- Strategy Config ------------------------------------------------------
 EVAL_CONFIG = {
     "stop_pts": 5.0,
     "target_pts": 20.0,
     "contracts": 2,
-    "max_trades_per_day": 5,
-    "session_start_min": 9 * 60 + 30,   # 9:30 AM ET
-    "session_end_min": 15 * 60 + 45,    # 3:45 PM ET (full day)
+    "max_trades_per_session": 5,
     "min_dip_pts": 1.5,
     "min_down_bar_pts": 0.5,
     "rsi_oversold_max": 50.0,           # effectively disabled
@@ -121,9 +160,7 @@ FUNDED_CONFIG = {
     "stop_pts": 5.0,
     "target_pts": 20.0,
     "contracts": 2,
-    "max_trades_per_day": 5,
-    "session_start_min": 9 * 60 + 30,   # 9:30 AM ET
-    "session_end_min": 15 * 60 + 45,    # 3:45 PM ET
+    "max_trades_per_session": 5,
     "min_dip_pts": 1.5,
     "min_down_bar_pts": 0.5,
     "rsi_oversold_max": 50.0,
@@ -661,6 +698,8 @@ class AccountState:
 
     # Entry guard state (replaces overlapping _trade_active / _pending_exit_cooldown / cooldown_until)
     trades_today: int = 0
+    trades_this_session: int = 0
+    current_session: Optional[str] = None
     cooldown_until: Optional[datetime] = None
     last_exit_time: Optional[datetime] = None
     _trade_active: bool = False
@@ -787,7 +826,7 @@ def _compute_day_bias(bars: List[Dict], config: dict) -> dict:
 
     Returns dict with session_open, first_window_move.
     """
-    session_start = config["session_start_min"]
+    session_start = config.get("session_start_min", 9 * 60 + 30)  # default NY open
     first_window_end = session_start + config.get("day_bias_first_window_minutes", 15)
 
     session_open = None
@@ -952,7 +991,8 @@ class DashboardBuilder:
     def _build_header(self, now: datetime, market_open: bool, in_session: bool) -> Text:
         eng = self._engine
         market_str = "[bold green]OPEN[/]" if market_open else "[bold red]CLOSED[/]"
-        session_str = "[green]IN SESSION[/]" if in_session else "[dim]OUT[/]"
+        cur_session = get_current_session(now)
+        session_str = f"[green]{cur_session}[/]" if cur_session else "[dim]OUT[/]"
 
         pos_str = "[dim]FLAT[/]"
         for acc in eng.accounts.values():
@@ -1079,7 +1119,7 @@ class DashboardBuilder:
         tbl.add_column("DD Left", justify="right", ratio=2)
         tbl.add_column("Day PnL", justify="right", ratio=2)
         tbl.add_column("Position", justify="center", ratio=2)
-        tbl.add_column("Trades", justify="center", ratio=1)
+        tbl.add_column("Trades", justify="center", ratio=2)
         tbl.add_column("Status", justify="center", ratio=2)
 
         for acc in eng.accounts.values():
@@ -1120,7 +1160,7 @@ class DashboardBuilder:
                 dd_text,
                 day_text,
                 pos_text,
-                f"{acc.trades_today}/{EVAL_CONFIG['max_trades_per_day']}",
+                f"{acc.trades_this_session}/{EVAL_CONFIG['max_trades_per_session']} ({acc.trades_today}d)",
                 status,
             )
         return tbl
@@ -1143,8 +1183,8 @@ class DashboardBuilder:
         if not market_open:
             return Text("MKT CLOSED", style="dim")
 
-        if not in_session and acc.phase == Phase.EVAL:
-            return Text("WAIT SESSION", style="dim")
+        if not in_session:
+            return Text("BETWEEN SESSIONS", style="dim")
 
         remaining = acc.cooldown_remaining(now)
         if remaining is not None:
@@ -1596,9 +1636,8 @@ class TradingEngine:
 
     @staticmethod
     def _is_eval_session(dt_et: datetime) -> bool:
-        """Eval trades during configured session window."""
-        mins = dt_et.hour * 60 + dt_et.minute
-        return EVAL_CONFIG["session_start_min"] <= mins <= EVAL_CONFIG["session_end_min"]
+        """True if we're in any trading session."""
+        return get_current_session(dt_et) is not None
 
 # -- API Sync (fallback when WebSocket is down) ------------------------
 
@@ -1702,6 +1741,8 @@ class TradingEngine:
             acc.today = today_str
             acc.daily_pnl = 0.0
             acc.trades_today = 0
+            acc.trades_this_session = 0
+            acc.current_session = None
             acc.rt_trades_today = []
             acc.cooldown_until = None
             acc.last_exit_time = None
@@ -1832,8 +1873,18 @@ class TradingEngine:
             self._trail_stop(acc, current_price)
             return
 
+        # Session tracking: reset trades + cooldown on session change
+        session_name = get_current_session(now)
+        if session_name != acc.current_session:
+            if session_name is not None:
+                log.info(f"Account {acc.account_id}: session changed to {session_name} "
+                         f"(was {acc.current_session}), resetting session trade count + cooldown")
+            acc.current_session = session_name
+            acc.trades_this_session = 0
+            acc.cooldown_until = None  # fresh start each session
+
         # Close position outside session window
-        if not self._is_eval_session(now):
+        if session_name is None:
             if acc.position != 0:
                 self._close_position(acc, "session_end")
             return
@@ -1856,7 +1907,7 @@ class TradingEngine:
             if max_daily and acc.daily_pnl >= max_daily:
                 return
 
-        if acc.trades_today >= EVAL_CONFIG["max_trades_per_day"]:
+        if acc.trades_this_session >= EVAL_CONFIG["max_trades_per_session"]:
             return
 
         # Consolidated entry guard check
@@ -2002,9 +2053,18 @@ class TradingEngine:
             self._trail_stop(acc, current_price)
             return
 
+        # Session tracking: reset trades + cooldown on session change
+        session_name = get_current_session(now)
+        if session_name != acc.current_session:
+            if session_name is not None:
+                log.info(f"Account {acc.account_id}: session changed to {session_name} "
+                         f"(was {acc.current_session}), resetting session trade count + cooldown")
+            acc.current_session = session_name
+            acc.trades_this_session = 0
+            acc.cooldown_until = None  # fresh start each session
+
         # Close position outside session window
-        in_session = self._is_eval_session(now)  # same session hours
-        if not in_session:
+        if session_name is None:
             if acc.position != 0:
                 self._close_position(acc, "session_end")
             return
@@ -2027,7 +2087,7 @@ class TradingEngine:
             if max_daily and acc.daily_pnl >= max_daily:
                 return
 
-        if acc.trades_today >= cfg["max_trades_per_day"]:
+        if acc.trades_this_session >= cfg["max_trades_per_session"]:
             return
 
         # Consolidated entry guard check
@@ -2124,6 +2184,7 @@ class TradingEngine:
                 acc.target_price = entry_price - target_pts if target_pts else 0.0
             acc.highest_price_since_entry = entry_price
             acc.trades_today += 1
+            acc.trades_this_session += 1
 
             # Retry up to 3 times to capture stop order ID for trailing stop
             for attempt in range(1, 4):
@@ -2325,9 +2386,11 @@ Reads API_KEY from .env file (or --config / TOPSTEPX_API_KEY env var).
 
     console.print(Panel(
         "[bold]TopstepX Automated Trading Bot[/]\n\n"
-        f"Eval:   VWAP Micro Mean-Reversion ({EVAL_CONFIG['session_start_min']//60}:{EVAL_CONFIG['session_start_min']%60:02d}"
-        f"-{EVAL_CONFIG['session_end_min']//60}:{EVAL_CONFIG['session_end_min']%60:02d} ET)\n"
-        "Funded: VWAP MR with coast mode (same strategy, reduced risk)\n\n"
+        "Strategy: VWAP Micro Mean-Reversion\n"
+        "Sessions: Asia (6PM-2AM) → London (3AM-9:30AM) → NY (9:30AM-3:45PM ET)\n"
+        f"Trade cap: {EVAL_CONFIG['max_trades_per_session']}/session (resets each session), "
+        f"cd={LOSS_COOLDOWN_MINUTES}min\n"
+        "Funded: coast mode (reduced risk after threshold)\n\n"
         "Data feed: SignalR WebSocket (real-time) + REST fallback\n"
         f"Poll interval: {args.poll}s\n"
         "Press Ctrl+C to stop (positions closed safely)",

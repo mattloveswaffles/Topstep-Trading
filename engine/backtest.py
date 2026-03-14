@@ -522,6 +522,7 @@ def run_topstep_nq(
     df_1m: Optional[pd.DataFrame] = None,
     sessions: Optional[List[Tuple[int, int]]] = None,
     session_day_start_min: Optional[int] = None,
+    per_session_trade_reset: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
     Topstep-style NQ strategies with fixed-point brackets (stop_pts / target_pts).
@@ -593,6 +594,25 @@ def run_topstep_nq(
         df[timestamp_col], session_start_min, session_end_min, session_tz=session_tz,
         sessions=sessions,
     )
+    # Tag each bar with its session index (for per-session trade cap reset)
+    if per_session_trade_reset and sessions is not None:
+        _ts = df[timestamp_col]
+        if session_tz and hasattr(_ts.dt, "tz") and _ts.dt.tz is not None:
+            try:
+                _ts = _ts.dt.tz_convert(session_tz)
+            except Exception:
+                pass
+        _mins = _ts.dt.hour * 60 + _ts.dt.minute
+        sid = pd.Series(-1, index=df.index)
+        for idx, (s_start, s_end) in enumerate(sessions):
+            if s_start <= s_end:
+                m = (_mins >= s_start) & (_mins <= s_end)
+            else:
+                m = (_mins >= s_start) | (_mins <= s_end)
+            sid = sid.where(~m, idx)
+        df["_session_id"] = sid
+    else:
+        df["_session_id"] = 0
     # Shift trading_day boundary for overnight multi-session (e.g. 6PM start)
     if session_day_start_min is not None:
         local_dt = pd.to_datetime(df[timestamp_col])
@@ -652,6 +672,7 @@ def run_topstep_nq(
     trades_today = 0
     day_realized_pnl = 0.0
     last_day: Optional[str] = None
+    last_session_id: int = -1
     cooldown_until = None  # timestamp until which entries are blocked after a loss
     n = len(df)
 
@@ -664,10 +685,16 @@ def run_topstep_nq(
         l_ = float(row[low_col])
         day = row["trading_day"]
         in_session = bool(row["_session"])
+        cur_session_id = int(row["_session_id"])
         if day != last_day:
             trades_today = 0
             day_realized_pnl = 0.0
             last_day = day
+            last_session_id = -1
+        if per_session_trade_reset and cur_session_id != last_session_id and cur_session_id >= 0:
+            trades_today = 0
+            cooldown_until = None  # reset cooldown on new session open
+            last_session_id = cur_session_id
 
         if not in_session:
             if position != 0 and entry_price is not None:

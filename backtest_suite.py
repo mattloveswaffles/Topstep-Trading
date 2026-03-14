@@ -55,7 +55,7 @@ console = Console()
 DATA_PATH = "data/nq_1m.parquet"
 DEFAULT_SIMS = 50_000
 FUNDED_SIMS = 10_000
-FUNDED_MAX_DAYS = 500
+FUNDED_MAX_DAYS = 5500
 
 # Topstep funded account rules
 FUNDED_TRAILING_DD = 2000.0
@@ -95,6 +95,7 @@ class Strategy:
     max_daily_pnl: Optional[float] = None  # Stop trading for the day once daily PnL hits this
     sessions: Optional[List[Tuple[int, int]]] = None  # Multi-session: list of (start_min, end_min)
     session_day_start_min: Optional[int] = None  # Day boundary shift for overnight (e.g. 1080=6PM)
+    per_session_trade_reset: bool = False  # Reset trade cap at each session boundary
 
 
 # ── Register your strategies here ────────────────────────────────────────
@@ -256,13 +257,14 @@ register_strategy(
 # All sessions: Asia + London + NY (full Topstep day)
 register_strategy(
     name="vwap_mr_all_sessions",
-    description="VWAP MR — Asia+London+NY, shared 5-trade day cap",
+    description="VWAP MR — Asia+London+NY, cd180 + $1600 cap, per-session reset",
     strategy_type="vwap_micro",
     stop_pts=5.0, target_pts=20.0, contracts=2,
     sessions=[SESSION_ASIA, SESSION_LONDON, SESSION_NY],
     session_day_start_min=TOPSTEP_DAY_START,
     trailing_stop_pts=2.0, long_only=False,
     cooldown_after_loss_minutes=180, max_daily_pnl=1600.0,
+    per_session_trade_reset=True,
     params=_MR_PARAMS,
 )
 
@@ -335,6 +337,8 @@ class BacktestResult:
     # Funded results
     payout_pct: float = 0.0
     avg_days_to_payout: float = 0.0
+    avg_cal_days_to_payout: float = 0.0
+    avg_trade_days_to_payout: float = 0.0
     avg_per_payout: float = 0.0
     avg_total_extracted: float = 0.0
     avg_payouts: float = 0.0
@@ -387,6 +391,7 @@ def run_backtest(
         df_1m=df_1m,
         sessions=strategy.sessions,
         session_day_start_min=strategy.session_day_start_min,
+        per_session_trade_reset=strategy.per_session_trade_reset,
         **strategy.params,
     )
 
@@ -472,15 +477,33 @@ def run_funded_mc(
     n_sims: int = FUNDED_SIMS,
     max_days: int = FUNDED_MAX_DAYS,
     seed: int = 42,
+    total_calendar_days: int = 0,
+    total_data_days: int = 0,
 ) -> Dict:
-    """Simulate funded account payouts with consistency rule."""
+    """Simulate funded account payouts with consistency rule.
+    Calendar/trading day modeling matches eval MC:
+      flat_ratio = probability a day is market-closed (burns calendar day only).
+    """
     if trades_df.empty:
         return {
             "payout_pct": 0, "avg_days_to_payout": 0, "avg_per_payout": 0,
             "avg_total_extracted": 0, "avg_payouts": 0, "funded_bust_rate": 0,
+            "avg_calendar_days_to_payout": 0, "avg_trading_days_to_payout": 0,
         }
 
     daily_pnl = trades_df.groupby("trading_day")["pnl"].sum().values
+    n_trade_days = len(daily_pnl)
+    # Add zero-PnL entries for data days without trades
+    if total_data_days > n_trade_days:
+        zero_days = np.zeros(total_data_days - n_trade_days)
+        daily_pnl = np.concatenate([daily_pnl, zero_days])
+
+    # Flat ratio: probability a day is market-closed
+    if total_calendar_days > 0 and total_calendar_days > total_data_days:
+        flat_ratio = 1.0 - (max(total_data_days, n_trade_days) / total_calendar_days)
+    else:
+        flat_ratio = 0.0
+
     rng = np.random.default_rng(seed)
 
     N = n_sims
@@ -490,22 +513,40 @@ def run_funded_mc(
     profit_since_payout = np.zeros(N)
     total_extracted = np.zeros(N)
     payout_count = np.zeros(N, dtype=int)
-    first_payout_day = np.full(N, -1, dtype=int)
+    first_payout_cal = np.full(N, -1, dtype=int)
+    first_payout_trade = np.full(N, -1, dtype=int)
     alive = np.ones(N, dtype=bool)
+    calendar_day = np.zeros(N, dtype=int)
+    trading_day = np.zeros(N, dtype=int)
 
     for day in range(max_days):
         if not alive.any():
             break
 
+        calendar_day[alive] += 1
+
+        # Flat day check (market closed — burns calendar day only)
+        if flat_ratio > 0:
+            flat_roll = rng.random(size=N)
+            is_flat = flat_roll < flat_ratio
+            flat_mask = alive & is_flat
+            if flat_mask.all():
+                continue
+            trading_mask = alive & ~is_flat
+        else:
+            trading_mask = alive
+
+        trading_day[trading_mask] += 1
+
         idx = rng.integers(0, len(daily_pnl), size=N)
         dpnl = daily_pnl[idx].copy()
         dpnl = np.maximum(dpnl, -FUNDED_DAILY_LOSS)
 
-        equity[alive] += dpnl[alive]
-        peak[alive] = np.maximum(peak[alive], equity[alive])
-        profit_since_payout[alive] += dpnl[alive]
+        equity[trading_mask] += dpnl[trading_mask]
+        peak[trading_mask] = np.maximum(peak[trading_mask], equity[trading_mask])
+        profit_since_payout[trading_mask] += dpnl[trading_mask]
 
-        winning_days[alive & (dpnl >= WINNING_DAY_THRESHOLD)] += 1
+        winning_days[trading_mask & (dpnl >= WINNING_DAY_THRESHOLD)] += 1
 
         # Trailing DD bust
         dd = peak - equity
@@ -527,15 +568,18 @@ def run_funded_mc(
             payout_count[can_pay] += 1
             winning_days[can_pay] = 0
             profit_since_payout[can_pay] = 0.0
-            first_time = can_pay & (first_payout_day == -1)
-            first_payout_day[first_time] = day + 1
+            first_time = can_pay & (first_payout_cal == -1)
+            first_payout_cal[first_time] = calendar_day[first_time]
+            first_payout_trade[first_time] = trading_day[first_time]
 
     got_payout = payout_count > 0
     pct = got_payout.sum() / N * 100
 
     return {
         "payout_pct": pct,
-        "avg_days_to_payout": float(first_payout_day[got_payout].mean()) if got_payout.any() else 0,
+        "avg_days_to_payout": float(first_payout_trade[got_payout].mean()) if got_payout.any() else 0,
+        "avg_calendar_days_to_payout": float(first_payout_cal[got_payout].mean()) if got_payout.any() else 0,
+        "avg_trading_days_to_payout": float(first_payout_trade[got_payout].mean()) if got_payout.any() else 0,
         "avg_per_payout": float(total_extracted[got_payout].sum() / payout_count[got_payout].sum()) if got_payout.any() else 0,
         "avg_total_extracted": float(total_extracted[got_payout].mean()) if got_payout.any() else 0,
         "avg_payouts": float(payout_count[got_payout].mean()) if got_payout.any() else 0,
@@ -551,21 +595,32 @@ def run_funded_mc_coast(
     n_sims: int = FUNDED_SIMS,
     max_days: int = FUNDED_MAX_DAYS,
     seed: int = 42,
+    total_calendar_days: int = 0,
+    total_data_days: int = 0,
 ) -> Dict:
     """
     Funded MC with coast mode: once profit_since_payout exceeds coast_threshold,
     switch to safer trades (scaled PnL and/or capped daily PnL).
-
-    coast_scale: multiply PnL by this when coasting (0.5 = 1 contract instead of 2)
-    coast_daily_cap: if set, cap daily PnL at this value when coasting
+    Calendar/trading day modeling matches eval MC.
     """
     if trades_df.empty:
         return {
             "payout_pct": 0, "avg_days_to_payout": 0, "avg_per_payout": 0,
             "avg_total_extracted": 0, "avg_payouts": 0, "funded_bust_rate": 0,
+            "avg_calendar_days_to_payout": 0, "avg_trading_days_to_payout": 0,
         }
 
     daily_pnl = trades_df.groupby("trading_day")["pnl"].sum().values
+    n_trade_days = len(daily_pnl)
+    if total_data_days > n_trade_days:
+        zero_days = np.zeros(total_data_days - n_trade_days)
+        daily_pnl = np.concatenate([daily_pnl, zero_days])
+
+    if total_calendar_days > 0 and total_calendar_days > total_data_days:
+        flat_ratio = 1.0 - (max(total_data_days, n_trade_days) / total_calendar_days)
+    else:
+        flat_ratio = 0.0
+
     rng = np.random.default_rng(seed)
 
     N = n_sims
@@ -575,29 +630,45 @@ def run_funded_mc_coast(
     profit_since_payout = np.zeros(N)
     total_extracted = np.zeros(N)
     payout_count = np.zeros(N, dtype=int)
-    first_payout_day = np.full(N, -1, dtype=int)
+    first_payout_cal = np.full(N, -1, dtype=int)
+    first_payout_trade = np.full(N, -1, dtype=int)
     alive = np.ones(N, dtype=bool)
+    calendar_day = np.zeros(N, dtype=int)
+    trading_day = np.zeros(N, dtype=int)
 
     for day in range(max_days):
         if not alive.any():
             break
+
+        calendar_day[alive] += 1
+
+        if flat_ratio > 0:
+            flat_roll = rng.random(size=N)
+            is_flat = flat_roll < flat_ratio
+            trading_mask = alive & ~is_flat
+            if not trading_mask.any():
+                continue
+        else:
+            trading_mask = alive
+
+        trading_day[trading_mask] += 1
 
         idx = rng.integers(0, len(daily_pnl), size=N)
         dpnl = daily_pnl[idx].copy().astype(float)
         dpnl = np.maximum(dpnl, -FUNDED_DAILY_LOSS)
 
         # Coast mode: scale down PnL for sims that exceeded threshold
-        coasting = alive & (profit_since_payout >= coast_threshold)
+        coasting = trading_mask & (profit_since_payout >= coast_threshold)
         if coasting.any():
             dpnl[coasting] *= coast_scale
             if coast_daily_cap is not None:
                 dpnl[coasting] = np.clip(dpnl[coasting], -FUNDED_DAILY_LOSS * coast_scale, coast_daily_cap)
 
-        equity[alive] += dpnl[alive]
-        peak[alive] = np.maximum(peak[alive], equity[alive])
-        profit_since_payout[alive] += dpnl[alive]
+        equity[trading_mask] += dpnl[trading_mask]
+        peak[trading_mask] = np.maximum(peak[trading_mask], equity[trading_mask])
+        profit_since_payout[trading_mask] += dpnl[trading_mask]
 
-        winning_days[alive & (dpnl >= WINNING_DAY_THRESHOLD)] += 1
+        winning_days[trading_mask & (dpnl >= WINNING_DAY_THRESHOLD)] += 1
 
         # Trailing DD bust
         dd = peak - equity
@@ -619,15 +690,18 @@ def run_funded_mc_coast(
             payout_count[can_pay] += 1
             winning_days[can_pay] = 0
             profit_since_payout[can_pay] = 0.0
-            first_time = can_pay & (first_payout_day == -1)
-            first_payout_day[first_time] = day + 1
+            first_time = can_pay & (first_payout_cal == -1)
+            first_payout_cal[first_time] = calendar_day[first_time]
+            first_payout_trade[first_time] = trading_day[first_time]
 
     got_payout = payout_count > 0
     pct = got_payout.sum() / N * 100
 
     return {
         "payout_pct": pct,
-        "avg_days_to_payout": float(first_payout_day[got_payout].mean()) if got_payout.any() else 0,
+        "avg_days_to_payout": float(first_payout_trade[got_payout].mean()) if got_payout.any() else 0,
+        "avg_calendar_days_to_payout": float(first_payout_cal[got_payout].mean()) if got_payout.any() else 0,
+        "avg_trading_days_to_payout": float(first_payout_trade[got_payout].mean()) if got_payout.any() else 0,
         "avg_per_payout": float(total_extracted[got_payout].sum() / payout_count[got_payout].sum()) if got_payout.any() else 0,
         "avg_total_extracted": float(total_extracted[got_payout].mean()) if got_payout.any() else 0,
         "avg_payouts": float(payout_count[got_payout].mean()) if got_payout.any() else 0,
@@ -673,7 +747,8 @@ def evaluate_strategy(
     )
 
     # Funded MC
-    funded_mc = run_funded_mc(trades_df, n_sims=n_funded_sims)
+    funded_mc = run_funded_mc(trades_df, n_sims=n_funded_sims,
+                              total_calendar_days=total_cal_days, total_data_days=total_data_days)
 
     # Full cycle EV: pass_rate * (funded_extracted - activation_fee) - (1 - pass_rate) * combine_cost
     pr = eval_mc["pass_rate"] / 100
@@ -707,6 +782,8 @@ def evaluate_strategy(
         # Funded MC
         payout_pct=funded_mc["payout_pct"],
         avg_days_to_payout=funded_mc["avg_days_to_payout"],
+        avg_cal_days_to_payout=funded_mc.get("avg_calendar_days_to_payout", 0),
+        avg_trade_days_to_payout=funded_mc.get("avg_trading_days_to_payout", 0),
         avg_per_payout=funded_mc["avg_per_payout"],
         avg_total_extracted=funded_mc["avg_total_extracted"],
         avg_payouts=funded_mc["avg_payouts"],
@@ -745,6 +822,8 @@ class ComboResult:
     funded_profit_factor: float = 0.0
     payout_pct: float = 0.0
     avg_days_to_payout: float = 0.0
+    avg_cal_days_to_payout: float = 0.0
+    avg_trade_days_to_payout: float = 0.0
     avg_per_payout: float = 0.0
     avg_total_extracted: float = 0.0
     avg_payouts: float = 0.0
@@ -794,7 +873,8 @@ def evaluate_combo(
         return ComboResult(eval_strategy=eval_strategy.name, funded_strategy=funded_strategy.name)
 
     funded_stats = compute_trade_stats(funded_trades_df)
-    funded_mc = run_funded_mc(funded_trades_df, n_sims=n_funded_sims)
+    funded_mc = run_funded_mc(funded_trades_df, n_sims=n_funded_sims,
+                              total_calendar_days=total_cal_days, total_data_days=total_data_days)
 
     # Full cycle EV
     pr = eval_mc["pass_rate"] / 100
@@ -822,6 +902,8 @@ def evaluate_combo(
         funded_profit_factor=funded_stats["profit_factor"],
         payout_pct=funded_mc["payout_pct"],
         avg_days_to_payout=funded_mc["avg_days_to_payout"],
+        avg_cal_days_to_payout=funded_mc.get("avg_calendar_days_to_payout", 0),
+        avg_trade_days_to_payout=funded_mc.get("avg_trading_days_to_payout", 0),
         avg_per_payout=funded_mc["avg_per_payout"],
         avg_total_extracted=funded_mc["avg_total_extracted"],
         avg_payouts=funded_mc["avg_payouts"],
@@ -919,7 +1001,8 @@ def display_combo_detail(result: ComboResult):
     t.add_row("Avg PnL/Trade", f"${result.funded_avg_pnl:,.2f}")
     t.add_row("Profit Factor", f"{result.funded_profit_factor:.2f}")
     t.add_row("Funded Payout Rate", f"{result.payout_pct:.1f}%")
-    t.add_row("Avg Days to First Payout", f"{result.avg_days_to_payout:.0f}")
+    t.add_row("Avg Calendar Days to Payout", f"{result.avg_cal_days_to_payout:.1f}")
+    t.add_row("Avg Trading Days to Payout", f"{result.avg_trade_days_to_payout:.1f}")
     t.add_row("Avg Per Payout", f"${result.avg_per_payout:,.0f}")
     t.add_row("Avg Payouts", f"{result.avg_payouts:.1f}")
     t.add_row("Avg Total Extracted", f"${result.avg_total_extracted:,.0f}")
@@ -1018,7 +1101,8 @@ def grid_search(
             trades_df, total_calendar_days=total_cal_days,
             total_data_days=total_data_days, n_sims=n_sims,
         )
-        funded_mc = run_funded_mc(trades_df, n_sims=min(n_sims, 5000))
+        funded_mc = run_funded_mc(trades_df, n_sims=min(n_sims, 5000),
+                                  total_calendar_days=total_cal_days, total_data_days=total_data_days)
 
         pr = eval_mc["pass_rate"] / 100
         full_ev = pr * (funded_mc["avg_total_extracted"] - ACTIVATION_FEE) - (1 - pr) * COMBINE_COST
@@ -1116,7 +1200,8 @@ def display_result(result: BacktestResult):
     t.add_row("Eval EV", f"${result.eval_ev:,.0f}")
     t.add_row("", "")
     t.add_row("Funded Payout Rate", f"{result.payout_pct:.1f}%")
-    t.add_row("Avg Days to First Payout", f"{result.avg_days_to_payout:.0f}")
+    t.add_row("Avg Calendar Days to Payout", f"{result.avg_cal_days_to_payout:.1f}")
+    t.add_row("Avg Trading Days to Payout", f"{result.avg_trade_days_to_payout:.1f}")
     t.add_row("Avg Per Payout", f"${result.avg_per_payout:,.0f}")
     t.add_row("Avg Payouts Before Bust", f"{result.avg_payouts:.1f}")
     t.add_row("Avg Total Extracted", f"${result.avg_total_extracted:,.0f}")
@@ -1355,6 +1440,8 @@ def main():
                 coast_scale=cfg["scale"],
                 coast_daily_cap=cfg["cap"],
                 n_sims=10000,
+                total_calendar_days=total_cal_days,
+                total_data_days=total_data_days,
             )
             full_ev = pr * (mc["avg_total_extracted"] - ACTIVATION_FEE) - (1 - pr) * COMBINE_COST
             if full_ev > best_ev:
@@ -1364,13 +1451,14 @@ def main():
 
         # Print as a clean list
         console.print("[bold]Funded Coast Mode Comparison[/]\n")
-        console.print(f"  {'Config':<34} {'Pay%':>6} {'Days':>5} {'$/Pay':>8} {'#Pay':>5} {'Extracted':>11} {'Bust%':>7} {'Cycle EV':>10}")
-        console.print(f"  {'-'*34} {'-'*6} {'-'*5} {'-'*8} {'-'*5} {'-'*11} {'-'*7} {'-'*10}")
+        console.print(f"  {'Config':<34} {'Pay%':>6} {'CalDays':>7} {'TrdDays':>7} {'$/Pay':>8} {'#Pay':>5} {'Extracted':>11} {'Bust%':>7} {'Cycle EV':>10}")
+        console.print(f"  {'-'*34} {'-'*6} {'-'*7} {'-'*7} {'-'*8} {'-'*5} {'-'*11} {'-'*7} {'-'*10}")
         for label, mc, full_ev in rows:
             ev_style = "[bold green]" if full_ev == best_ev else ""
             ev_end = "[/]" if ev_style else ""
             console.print(
-                f"  {label:<34} {mc['payout_pct']:>5.1f}% {mc['avg_days_to_payout']:>5.0f} "
+                f"  {label:<34} {mc['payout_pct']:>5.1f}% {mc['avg_calendar_days_to_payout']:>7.1f} "
+                f"{mc['avg_trading_days_to_payout']:>7.1f} "
                 f"${mc['avg_per_payout']:>6,.0f} {mc['avg_payouts']:>5.1f} "
                 f"${mc['avg_total_extracted']:>9,.0f} {mc['funded_bust_rate']:>6.1f}% "
                 f"{ev_style}${full_ev:>8,.0f}{ev_end}"
