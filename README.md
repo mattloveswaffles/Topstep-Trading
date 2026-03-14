@@ -1,6 +1,6 @@
-# Topstep NQ Futures Trading Bot - Current Implementation Results
+# Topstep NQ Futures Trading Bot
 
-Automated VWAP Mean-Reversion strategy for passing Topstep 50K Combine evaluations on NQ (Nasdaq-100 E-mini) futures.
+Automated VWAP Mean-Reversion strategy for passing Topstep 50K Combine evaluations and extracting payouts on NQ (Nasdaq-100 E-mini) futures.
 
 ## Strategy: VWAP Micro Mean-Reversion
 
@@ -16,29 +16,51 @@ Trades price dips below (longs) and spikes above (shorts) the intraday VWAP on 5
 
 **Exit:** 5pt initial stop, 2pt trailing stop, 20pt target. Bracket orders managed by the exchange.
 
-**Session:** 9:30 AM - 3:45 PM ET, max 5 trades/day, 2 contracts.
+**Risk Management:**
+- 180-minute cooldown after any losing trade (resets at session open)
+- $1,600 daily profit cap (stops trading for the day once reached)
+- $1,000 daily loss limit
+- Coast mode on funded accounts: reduces to 1 contract + $200 daily cap after $1,500 profit since last payout
 
-**Backtest results (pessimistic):**
-- 1,230 trades over 410 days (2021-2026)
-- 37% win rate, $143 avg PnL/trade, 2.14 profit factor
-- 90.8% eval pass rate, ~10 calendar days avg
+**Sessions (all traded, per-session trade reset):**
+| Session | Hours (ET) | Trades |
+|---------|-----------|--------|
+| Asia    | 6:00 PM - 2:00 AM | 5/session |
+| London  | 3:00 AM - 9:30 AM | 5/session |
+| NY      | 9:30 AM - 3:45 PM | 5/session |
+
+Trade count and cooldown reset at the start of each session. 2 contracts per trade (1 in coast mode).
+
+## Architecture
+
+- **topstep_bot.py** — Live trading bot with Rich TUI dashboard
+- **backtest_suite.py** — Strategy backtesting + Monte Carlo simulation
+- **engine/backtest.py** — Core backtest engine
+- **engine/alpha.py** — Signal generation from historical data
+- **test_pipeline.py** — Practice account integration test
+
+**Data feed:** SignalR WebSocket (real-time) with REST API fallback. 5-second poll interval.
+
+**Notifications:** Optional Telegram integration for session summaries, eval pass alerts, and payout-ready alerts. Runs on a background thread to never block trading.
 
 ## Setup
 
-1. **Clone and install:**
+1. **Install dependencies:**
 ```bash
-git clone <repo-url> && cd <repo>
-python -m venv venv
-source venv/bin/activate
-pip install requests pandas numpy numba rich python-dotenv
+pip install requests pandas numpy numba rich python-dotenv signalrcore
 ```
 
-2. **Configure API key:**
+2. **Configure:**
 ```bash
 cp .env.example .env
-# Edit .env with your TopstepX API key and username
-# Get API key from: TopstepX Dashboard -> Settings -> API Access
 ```
+```
+API_KEY=your_topstepx_api_key
+TOPSTEPX_USERNAME=your_email
+TELEGRAM_BOT_TOKEN=your_bot_token    # optional
+TELEGRAM_CHAT_ID=your_chat_id        # optional, auto-discovered if omitted
+```
+Get API key from: TopstepX Dashboard -> Settings -> API Access
 
 3. **Run the bot:**
 ```bash
@@ -48,9 +70,14 @@ python topstep_bot.py
 For persistent server deployment:
 ```bash
 tmux new -s bot
-source venv/bin/activate
 python topstep_bot.py
 # Ctrl+B then D to detach
+```
+
+4. **Run backtests:**
+```bash
+python backtest_suite.py --combo --eval-strategy vwap_mr_all_sessions
+python backtest_suite.py --coast --strategy vwap_mr_all_sessions
 ```
 
 ## Topstep Rules
@@ -70,32 +97,14 @@ python topstep_bot.py
 
 ### Payout Rules
 
-- **Consistency rule:** Must have 5 winning days ($150+ PnL each) before requesting a payout. Days do not need to be consecutive. Counter resets after each payout.
+- **Consistency rule:** 5 winning days ($150+ PnL each) before requesting payout. Counter resets after each payout.
 - **Max payout:** $5,000 or 50% of profit balance (whichever is less)
+- **Auto-pause:** Bot stops trading on accounts eligible for payout until processed
 - **Processing:** Payouts requested through TopstepX dashboard
 
-## Expected Returns (Monte Carlo, 50K sims)
+## Telegram Notifications
 
-### Eval Phase
-
-- **Pass rate:** 90.8%
-- **Avg calendar days to pass:** ~10
-- **Avg profit on pass:** $3,932
-
-### Funded Phase
-
-- **95%** of funded accounts get at least 1 payout
-- **7 trading days** to first payout on average
-- **$2,032** average per payout
-- **2 payouts** on average before bust
-- **$3,977** total extracted on average
-
-### Full Cycle EV
-
-| Step | Cost | Expected Return |
-|------|------|-----------------|
-| Combine fee | -$50 | |
-| Eval pass (90.8%) | | |
-| Activation fee | -$150 | |
-| Funded payouts | | +$3,977 |
-| **Net EV per attempt** | | **~$3,500** |
+When configured, the bot sends:
+- **Session-end summary:** PnL per account, each trade with timestamp and result, phase (EVAL/FUNDED)
+- **Eval passed:** Alert when an account clears the $3K profit target
+- **Payout ready:** Alert when a funded account has 5 winning days + positive profit, with estimated payout amount

@@ -20,7 +20,9 @@ import argparse
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 import time
 import traceback
 from collections import deque
@@ -180,6 +182,83 @@ COAST_DAILY_CAP = 200.0        # stop trading for the day once up $200
 LOSS_COOLDOWN_MINUTES = 180    # block entries for 3 hours after a loss
 STUCK_TRADE_TIMEOUT_SECS = 300 # force-clear _trade_active if stuck this long
 MIN_EXIT_GAP_SECS = 30         # min seconds between exit and next entry
+
+
+# =========================================================================
+# Telegram Notifications (optional -- set TELEGRAM_BOT_TOKEN in .env)
+# =========================================================================
+
+class TelegramNotifier:
+    """Sends Telegram messages from a background thread so it never blocks trading."""
+
+    def __init__(self, bot_token: str, chat_id: Optional[str] = None):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _resolve_chat_id(self) -> bool:
+        """Auto-discover chat_id from the most recent message sent to the bot."""
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{self.bot_token}/getUpdates",
+                params={"limit": 1, "offset": -1},
+                timeout=10,
+            )
+            data = resp.json()
+            results = data.get("result", [])
+            if results:
+                msg = results[0].get("message") or results[0].get("channel_post", {})
+                chat = msg.get("chat", {})
+                self.chat_id = str(chat.get("id", ""))
+                if self.chat_id:
+                    log.info(f"Telegram chat_id auto-discovered: {self.chat_id}")
+                    return True
+            log.warning("Telegram: no messages found. Send any message to the bot first, then restart.")
+        except Exception as e:
+            log.warning(f"Telegram chat_id discovery failed: {e}")
+        return False
+
+    def _worker(self):
+        """Background thread that drains the message queue."""
+        while True:
+            msg = self._queue.get()
+            if msg is None:
+                break
+            if not self.chat_id:
+                if not self._resolve_chat_id():
+                    continue
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                    json={
+                        "chat_id": self.chat_id,
+                        "text": msg,
+                        "parse_mode": "HTML",
+                    },
+                    timeout=10,
+                )
+            except Exception as e:
+                log.warning(f"Telegram send failed: {e}")
+
+    def send(self, text: str):
+        """Enqueue a message (non-blocking)."""
+        self._queue.put(text)
+
+
+def _build_telegram_notifier() -> Optional[TelegramNotifier]:
+    """Create notifier if TELEGRAM_BOT_TOKEN is set."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return None
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    log.info(f"Telegram notifications enabled (chat_id={'set' if chat_id else 'auto-discover'})")
+    return TelegramNotifier(token, chat_id)
+
+
+# Global notifier instance (set in main)
+_telegram: Optional[TelegramNotifier] = None
 
 
 # =========================================================================
@@ -715,9 +794,11 @@ class AccountState:
     lifetime_extracted: float = 0.0
     total_payouts: int = 0
     total_extracted: float = 0.0
+    _payout_notified: bool = False
 
     # Real-time trade log (from WebSocket)
     rt_trades_today: list = field(default_factory=list)
+    session_trades_log: list = field(default_factory=list)  # trades in current session for TG summary
 
     # Status
     active: bool = True
@@ -1173,6 +1254,9 @@ class DashboardBuilder:
         if acc.phase == Phase.EVAL and acc.equity >= EVAL_PROFIT_TARGET:
             return Text("PASSED!", style="bold green")
 
+        if acc._payout_notified:
+            return Text("PAYOUT READY", style="bold green")
+
         if acc.position != 0:
             cur_px = _bar_close(acc.bars_5m[-1]) if acc.bars_5m else acc.entry_price
             # Use signed position for correct unrealized P&L (negative for shorts)
@@ -1311,6 +1395,70 @@ class TradingEngine:
     def _log_activity(self, msg: str, style: str = ""):
         ts = self._now_et().strftime("%H:%M:%S")
         self._activity_log.append((ts, msg, style))
+
+    # -- Telegram Helpers --------------------------------------------------
+
+    def _notify_session_end(self, acc: AccountState, ended_session: str):
+        """Send Telegram summary when a trading session ends."""
+        if _telegram is None:
+            return
+
+        phase_str = acc.phase.value.upper()
+        trades = acc.session_trades_log
+        session_pnl = sum(float(t.get("profitAndLoss", 0)) - float(t.get("fees", 0)) for t in trades)
+
+        lines = [
+            f"<b>Session End: {ended_session}</b>",
+            f"Account: {acc.name}",
+            f"Phase: {phase_str}",
+            f"Session PnL: <b>${session_pnl:+,.2f}</b>",
+            f"Trades: {len(trades)}",
+        ]
+
+        for i, t in enumerate(trades, 1):
+            ts_raw = t.get("creationTimestamp") or t.get("timestamp", "")
+            try:
+                ts = pd.to_datetime(ts_raw)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                time_str = ts.astimezone(ET).strftime("%I:%M %p")
+            except Exception:
+                time_str = "?"
+            pnl = float(t.get("profitAndLoss", 0))
+            fees = float(t.get("fees", 0))
+            net = pnl - fees
+            side_str = "SELL" if t.get("side") == 0 else "BUY"
+            lines.append(f"  {i}. {time_str} {side_str} → ${net:+,.2f}")
+
+        lines.append(f"\nDay PnL: ${acc.daily_pnl:+,.2f}")
+        lines.append(f"Equity: ${acc.equity:+,.2f}")
+
+        _telegram.send("\n".join(lines))
+
+    def _notify_eval_passed(self, acc: AccountState):
+        """Send Telegram alert when an eval account passes."""
+        if _telegram is None:
+            return
+        _telegram.send(
+            f"🎉 <b>EVAL PASSED!</b>\n"
+            f"Account: {acc.name}\n"
+            f"Equity: ${acc.equity:+,.2f}\n"
+            f"Trading Days: {acc.trading_days}\n\n"
+            f"Account is now ready to transition to FUNDED!"
+        )
+
+    def _notify_payout_ready(self, acc: AccountState):
+        """Send Telegram alert when a funded account is eligible for payout."""
+        if _telegram is None:
+            return
+        payout_amt = min(acc.profit_since_payout * PAYOUT_BAL_PCT, PAYOUT_MAX)
+        _telegram.send(
+            f"💰 <b>PAYOUT READY!</b>\n"
+            f"Account: {acc.name}\n"
+            f"Winning Days: {acc.winning_days}/{WINNING_DAYS_REQUIRED}\n"
+            f"Profit Since Payout: ${acc.profit_since_payout:+,.2f}\n"
+            f"Est. Payout: ${payout_amt:,.2f}"
+        )
 
     # -- Setup -------------------------------------------------------------
 
@@ -1502,6 +1650,7 @@ class TradingEngine:
         acc.daily_pnl += net
         acc.profit_since_payout += net
         acc.rt_trades_today.append(data)
+        acc.session_trades_log.append(data)
         acc._pending_exit_cooldown = False
         acc._trade_active = False
         log.info(
@@ -1876,12 +2025,19 @@ class TradingEngine:
         # Session tracking: reset trades + cooldown on session change
         session_name = get_current_session(now)
         if session_name != acc.current_session:
+            prev_session = acc.current_session
+            if prev_session is not None and acc.session_trades_log:
+                self._notify_session_end(acc, prev_session)
             if session_name is not None:
-                log.info(f"Account {acc.account_id}: session changed to {session_name} "
-                         f"(was {acc.current_session}), resetting session trade count + cooldown")
+                log.info(
+                    f"Account {acc.account_id}: session changed "
+                    f"to {session_name} (was {prev_session}), "
+                    f"resetting session trade count + cooldown"
+                )
             acc.current_session = session_name
             acc.trades_this_session = 0
-            acc.cooldown_until = None  # fresh start each session
+            acc.cooldown_until = None
+            acc.session_trades_log = []
 
         # Close position outside session window
         if session_name is None:
@@ -2040,6 +2196,10 @@ class TradingEngine:
         now = self._now_et()
         cfg = FUNDED_CONFIG
 
+        # Payout ready -- stop trading until payout is processed
+        if acc._payout_notified:
+            return
+
         # Always fetch bars so dashboard has data even outside session
         bars = self._get_today_bars(now)
         if bars:
@@ -2056,12 +2216,19 @@ class TradingEngine:
         # Session tracking: reset trades + cooldown on session change
         session_name = get_current_session(now)
         if session_name != acc.current_session:
+            prev_session = acc.current_session
+            if prev_session is not None and acc.session_trades_log:
+                self._notify_session_end(acc, prev_session)
             if session_name is not None:
-                log.info(f"Account {acc.account_id}: session changed to {session_name} "
-                         f"(was {acc.current_session}), resetting session trade count + cooldown")
+                log.info(
+                    f"Account {acc.account_id}: session changed "
+                    f"to {session_name} (was {prev_session}), "
+                    f"resetting session trade count + cooldown"
+                )
             acc.current_session = session_name
             acc.trades_this_session = 0
-            acc.cooldown_until = None  # fresh start each session
+            acc.cooldown_until = None
+            acc.session_trades_log = []
 
         # Close position outside session window
         if session_name is None:
@@ -2254,6 +2421,15 @@ class TradingEngine:
                     and acc.equity >= EVAL_PROFIT_TARGET
                     and acc.trading_days >= 2):
                 log.info(f"EVAL PASSED: Acct {acc.account_id} | Equity=${acc.equity:,.2f}")
+                self._notify_eval_passed(acc)
+
+            # Check payout ready (funded) -- notify once
+            if (acc.phase == Phase.FUNDED
+                    and acc.winning_days >= WINNING_DAYS_REQUIRED
+                    and acc.profit_since_payout > 0
+                    and not acc._payout_notified):
+                acc._payout_notified = True
+                self._notify_payout_ready(acc)
 
         except Exception as e:
             log.error(f"Close failed on acct {acc.account_id}: {e}", exc_info=True)
@@ -2380,18 +2556,26 @@ Reads API_KEY from .env file (or --config / TOPSTEPX_API_KEY env var).
         console.print("  2. Generate API key")
         sys.exit(1)
 
+    global _telegram
+    _telegram = _build_telegram_notifier()
+
     api = ProjectXAPI(api_key, username)
     engine = TradingEngine(api)
     engine.POLL_INTERVAL = args.poll
 
+    tg_str = "ON" if _telegram else "OFF"
     console.print(Panel(
         "[bold]TopstepX Automated Trading Bot[/]\n\n"
         "Strategy: VWAP Micro Mean-Reversion\n"
-        "Sessions: Asia (6PM-2AM) → London (3AM-9:30AM) → NY (9:30AM-3:45PM ET)\n"
-        f"Trade cap: {EVAL_CONFIG['max_trades_per_session']}/session (resets each session), "
+        "Sessions: Asia (6PM-2AM) -> London (3AM-9:30AM) "
+        "-> NY (9:30AM-3:45PM ET)\n"
+        f"Trade cap: {EVAL_CONFIG['max_trades_per_session']}"
+        f"/session (resets each session), "
         f"cd={LOSS_COOLDOWN_MINUTES}min\n"
-        "Funded: coast mode (reduced risk after threshold)\n\n"
-        "Data feed: SignalR WebSocket (real-time) + REST fallback\n"
+        "Funded: coast mode (reduced risk after threshold)\n"
+        f"Telegram: {tg_str}\n\n"
+        "Data feed: SignalR WebSocket (real-time) + REST "
+        "fallback\n"
         f"Poll interval: {args.poll}s\n"
         "Press Ctrl+C to stop (positions closed safely)",
         title="Starting",
