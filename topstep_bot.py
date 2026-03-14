@@ -4,7 +4,7 @@ TopstepX Automated Trading Bot
 Runs 24/7 monitoring the market and trading NQ futures automatically.
 
 Phase 1 (EVAL):   VWAP Micro Mean-Reversion -- pass the 50K combine
-Phase 2 (FUNDED): VWAP Micro Mean-Reversion with coast mode -- extract payouts
+Phase 2 (FUNDED): VWAP Micro Mean-Reversion -- extract payouts
 
 Supports multiple accounts simultaneously, auto-detects eval vs funded.
 
@@ -96,10 +96,12 @@ EVAL_PROFIT_TARGET = 3000.0
 EVAL_TRAILING_DD = 2000.0
 DAILY_LOSS_LIMIT = 1000.0
 FUNDED_TRAILING_DD = 2000.0
-PAYOUT_MAX = 5000.0
+# Consistency Path payout rules
+PAYOUT_MAX = 6000.0
 PAYOUT_BAL_PCT = 0.50
 WINNING_DAY_THRESHOLD = 150.0
-WINNING_DAYS_REQUIRED = 5
+WINNING_DAYS_REQUIRED = 3
+CONSISTENCY_PCT = 0.40           # No single day > 40% of total profit
 
 # -- Session Definitions (ET) ---------------------------------------------
 # Each session: (name, start_min, end_min)
@@ -172,12 +174,6 @@ FUNDED_CONFIG = {
     "long_only": False,
     "max_daily_pnl": 1600.0,
 }
-
-# Coast mode: once profit_since_payout exceeds threshold, reduce risk
-# to protect gains and grind out the 5 winning days for payout
-COAST_THRESHOLD = 1500.0       # switch to coast mode at $1500 profit since payout
-COAST_CONTRACTS = 1            # trade 1 contract instead of 2
-COAST_DAILY_CAP = 200.0        # stop trading for the day once up $200
 
 LOSS_COOLDOWN_MINUTES = 180    # block entries for 3 hours after a loss
 STUCK_TRADE_TIMEOUT_SECS = 300 # force-clear _trade_active if stuck this long
@@ -788,12 +784,14 @@ class AccountState:
     bars_5m: list = field(default_factory=list)
     vwap: float = 0.0
 
-    # Funded payout tracking
+    # Funded payout tracking (Consistency Path)
     winning_days: int = 0
     profit_since_payout: float = 0.0
+    max_day_pnl_since_payout: float = 0.0  # Largest single day for 40% rule
     lifetime_extracted: float = 0.0
     total_payouts: int = 0
     total_extracted: float = 0.0
+    has_taken_payout: bool = False  # After first payout, DD floor = $0
     _payout_notified: bool = False
 
     # Real-time trade log (from WebSocket)
@@ -1204,8 +1202,12 @@ class DashboardBuilder:
         tbl.add_column("Status", justify="center", ratio=2)
 
         for acc in eng.accounts.values():
-            max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
-            dd_left = max_dd - (acc.peak - acc.equity)
+            if acc.phase == Phase.FUNDED and acc.has_taken_payout:
+                # After first payout, DD floor = $0 — can only lose remaining equity
+                dd_left = min(acc.equity, FUNDED_TRAILING_DD - (acc.peak - acc.equity))
+            else:
+                max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
+                dd_left = max_dd - (acc.peak - acc.equity)
 
             phase_text = Text(acc.phase.value.upper())
             phase_text.stylize("green" if acc.phase == Phase.EVAL else "blue")
@@ -1232,7 +1234,12 @@ class DashboardBuilder:
 
             extra = ""
             if acc.phase == Phase.FUNDED:
-                extra = f"\nW-days: {acc.winning_days}/{WINNING_DAYS_REQUIRED} | Extracted: ${acc.total_extracted:,.0f}"
+                max_day_limit = acc.profit_since_payout * CONSISTENCY_PCT if acc.profit_since_payout > 0 else 0
+                consistency_ok = acc.max_day_pnl_since_payout <= max_day_limit if max_day_limit > 0 else True
+                cons_mark = "✓" if consistency_ok else "✗"
+                extra = (f"\nW-days: {acc.winning_days}/{WINNING_DAYS_REQUIRED} | "
+                         f"40%: ${acc.max_day_pnl_since_payout:,.0f}/${max_day_limit:,.0f} {cons_mark} | "
+                         f"Ext: ${acc.total_extracted:,.0f}")
 
             tbl.add_row(
                 f"{acc.name} ({acc.account_id}){extra}",
@@ -1451,13 +1458,17 @@ class TradingEngine:
         """Send Telegram alert when a funded account is eligible for payout."""
         if _telegram is None:
             return
-        payout_amt = min(acc.profit_since_payout * PAYOUT_BAL_PCT, PAYOUT_MAX)
+        gross_payout = min(acc.profit_since_payout * PAYOUT_BAL_PCT, PAYOUT_MAX)
+        net_payout = gross_payout * 0.90  # 90/10 split
         _telegram.send(
-            f"💰 <b>PAYOUT READY!</b>\n"
+            f"💰 <b>PAYOUT READY!</b> (Consistency Path)\n"
             f"Account: {acc.name}\n"
             f"Winning Days: {acc.winning_days}/{WINNING_DAYS_REQUIRED}\n"
             f"Profit Since Payout: ${acc.profit_since_payout:+,.2f}\n"
-            f"Est. Payout: ${payout_amt:,.2f}"
+            f"Max Day: ${acc.max_day_pnl_since_payout:,.2f} "
+            f"(limit: ${acc.profit_since_payout * CONSISTENCY_PCT:,.2f})\n"
+            f"Request Payout: ${gross_payout:,.2f}\n"
+            f"You Receive: ${net_payout:,.2f} (90/10 split)"
         )
 
     # -- Setup -------------------------------------------------------------
@@ -1649,6 +1660,9 @@ class TradingEngine:
         net = float(pnl) - fees
         acc.daily_pnl += net
         acc.profit_since_payout += net
+        # Track largest single-day PnL for 40% consistency rule
+        if acc.daily_pnl > acc.max_day_pnl_since_payout:
+            acc.max_day_pnl_since_payout = acc.daily_pnl
         acc.rt_trades_today.append(data)
         acc.session_trades_log.append(data)
         acc._pending_exit_cooldown = False
@@ -1671,10 +1685,13 @@ class TradingEngine:
             t for t in acc.rt_trades_today if t.get("profitAndLoss") is not None
         ]) + (1 if acc.position != 0 else 0)
 
-        # Check trailing DD bust
+        # Check trailing DD bust (after payout, floor = $0)
         drawdown = acc.peak - acc.equity
         max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
-        if drawdown >= max_dd:
+        busted = drawdown >= max_dd
+        if acc.phase == Phase.FUNDED and acc.has_taken_payout and acc.equity <= 0:
+            busted = True
+        if busted:
             acc.active = False
             log.warning(f"RT BUST detected: acct {acc_id} | DD ${drawdown:,.2f}")
 
@@ -1732,6 +1749,8 @@ class TradingEngine:
                 acc.lifetime_extracted = data.get("lifetime_extracted", 0)
                 acc.total_payouts = data.get("total_payouts", 0)
                 acc.total_extracted = data.get("total_extracted", 0)
+                acc.has_taken_payout = data.get("has_taken_payout", acc.total_payouts > 0)
+                acc.max_day_pnl_since_payout = data.get("max_day_pnl_since_payout", 0)
                 acc.today = data.get("today", "")
                 acc.daily_pnl = data.get("daily_pnl", 0)
                 acc.trades_today = data.get("trades_today", 0)
@@ -1753,6 +1772,8 @@ class TradingEngine:
                 "lifetime_extracted": acc.lifetime_extracted,
                 "total_payouts": acc.total_payouts,
                 "total_extracted": acc.total_extracted,
+                "has_taken_payout": acc.has_taken_payout,
+                "max_day_pnl_since_payout": acc.max_day_pnl_since_payout,
                 "today": acc.today,
                 "daily_pnl": acc.daily_pnl,
                 "trades_today": acc.trades_today,
@@ -1846,14 +1867,37 @@ class TradingEngine:
             log.error(f"Failed to recover bracket orders: {e}", exc_info=True)
 
     def _sync_equity_from_api(self, acc: AccountState):
-        """Sync equity from account balance."""
+        """Sync equity from account balance.
+        Detects payout processing: if equity drops while payout was pending,
+        treat it as payout taken — reset peak, mark has_taken_payout.
+        """
         accounts = self.api.get_accounts()
         for a in accounts:
             if a.get("id") == acc.account_id:
                 api_balance = a.get("balance")
                 if api_balance is not None:
                     bal = float(api_balance)
-                    acc.equity = bal - START_BALANCE
+                    new_equity = bal - START_BALANCE
+                    # Detect payout: equity dropped while payout was pending
+                    if (acc._payout_notified
+                            and acc.phase == Phase.FUNDED
+                            and new_equity < acc.equity - 100):  # >$100 drop = payout taken
+                        payout_amt = acc.equity - new_equity
+                        acc.has_taken_payout = True
+                        acc.total_payouts += 1
+                        acc.total_extracted += payout_amt
+                        acc.winning_days = 0
+                        acc.profit_since_payout = 0.0
+                        acc.max_day_pnl_since_payout = 0.0
+                        # DD resets after payout — peak resets to new equity
+                        acc.peak = new_equity
+                        acc._payout_notified = False
+                        log.info(f"PAYOUT DETECTED: acct {acc.account_id} | "
+                                 f"${payout_amt:,.2f} withdrawn | "
+                                 f"new equity=${new_equity:,.2f} | "
+                                 f"total payouts={acc.total_payouts}")
+                        self._log_activity(f"Payout #{acc.total_payouts}: ${payout_amt:,.2f} withdrawn", "green")
+                    acc.equity = new_equity
                     acc.peak = max(acc.peak, acc.equity)
                 break
 
@@ -2051,17 +2095,10 @@ class TradingEngine:
                 self._close_position(acc, "daily_loss_cap")
             return
 
-        # Coast mode: reduce risk once profit_since_payout exceeds threshold
-        coasting = acc.profit_since_payout >= COAST_THRESHOLD
-
         # Daily profit cap
-        if coasting:
-            if acc.daily_pnl >= COAST_DAILY_CAP:
-                return
-        else:
-            max_daily = EVAL_CONFIG.get("max_daily_pnl")
-            if max_daily and acc.daily_pnl >= max_daily:
-                return
+        max_daily = EVAL_CONFIG.get("max_daily_pnl")
+        if max_daily and acc.daily_pnl >= max_daily:
+            return
 
         if acc.trades_this_session >= EVAL_CONFIG["max_trades_per_session"]:
             return
@@ -2096,11 +2133,9 @@ class TradingEngine:
         # Check for new entry
         stop_ticks = pts_to_ticks(EVAL_CONFIG["stop_pts"])
         target_ticks = pts_to_ticks(EVAL_CONFIG["target_pts"])
-        qty = COAST_CONTRACTS if coasting else EVAL_CONFIG["contracts"]
+        qty = EVAL_CONFIG["contracts"]
 
         if check_vwap_mr_entry(bars, EVAL_CONFIG, prev_day_close=prev_day_close):
-            if coasting:
-                log.info(f"COAST MODE: acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
             self._open_position(
                 acc,
                 side=OrderSide.BID,
@@ -2113,8 +2148,6 @@ class TradingEngine:
             )
         elif (not EVAL_CONFIG.get("long_only", True)
               and check_vwap_mr_short_entry(bars, EVAL_CONFIG, prev_day_close=prev_day_close)):
-            if coasting:
-                log.info(f"COAST MODE: acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
             self._open_position(
                 acc,
                 side=OrderSide.ASK,
@@ -2192,7 +2225,7 @@ class TradingEngine:
             log.error(f"Failed to find/modify stop order: {e}", exc_info=True)
 
     def _trade_funded(self, acc: AccountState):
-        """VWAP Micro MR strategy for funded accounts with coast mode."""
+        """VWAP Micro MR strategy for funded accounts."""
         now = self._now_et()
         cfg = FUNDED_CONFIG
 
@@ -2242,17 +2275,10 @@ class TradingEngine:
                 self._close_position(acc, "daily_loss_cap")
             return
 
-        # Coast mode: once profit_since_payout exceeds threshold, reduce risk
-        coasting = acc.profit_since_payout >= COAST_THRESHOLD
-
         # Daily profit cap
-        if coasting:
-            if acc.daily_pnl >= COAST_DAILY_CAP:
-                return
-        else:
-            max_daily = cfg.get("max_daily_pnl")
-            if max_daily and acc.daily_pnl >= max_daily:
-                return
+        max_daily = cfg.get("max_daily_pnl")
+        if max_daily and acc.daily_pnl >= max_daily:
+            return
 
         if acc.trades_this_session >= cfg["max_trades_per_session"]:
             return
@@ -2284,11 +2310,9 @@ class TradingEngine:
         # Check for new entry
         stop_ticks = pts_to_ticks(cfg["stop_pts"])
         target_ticks = pts_to_ticks(cfg["target_pts"])
-        qty = COAST_CONTRACTS if coasting else cfg["contracts"]
+        qty = cfg["contracts"]
 
         if check_vwap_mr_entry(bars, cfg, prev_day_close=prev_day_close):
-            if coasting:
-                log.info(f"COAST MODE (funded): acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
             self._open_position(
                 acc,
                 side=OrderSide.BID,
@@ -2301,8 +2325,6 @@ class TradingEngine:
             )
         elif (not cfg.get("long_only", True)
               and check_vwap_mr_short_entry(bars, cfg, prev_day_close=prev_day_close)):
-            if coasting:
-                log.info(f"COAST MODE (funded): acct {acc.account_id} | profit_since_payout=${acc.profit_since_payout:,.0f} | using {qty} contract(s)")
             self._open_position(
                 acc,
                 side=OrderSide.ASK,
@@ -2409,10 +2431,13 @@ class TradingEngine:
             acc.clear_position_state()
             acc.last_exit_time = self._now_et()
 
-            # Check trailing DD bust
+            # Check trailing DD bust (after payout, floor = $0)
             drawdown = acc.peak - acc.equity
             max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
-            if drawdown >= max_dd:
+            busted = drawdown >= max_dd
+            if acc.phase == Phase.FUNDED and acc.has_taken_payout and acc.equity <= 0:
+                busted = True
+            if busted:
                 acc.active = False
                 log.warning(f"BUST: Acct {acc.account_id} | DD ${drawdown:,.2f} >= ${max_dd:,.2f}")
 
@@ -2423,10 +2448,13 @@ class TradingEngine:
                 log.info(f"EVAL PASSED: Acct {acc.account_id} | Equity=${acc.equity:,.2f}")
                 self._notify_eval_passed(acc)
 
-            # Check payout ready (funded) -- notify once
+            # Check payout ready (funded, Consistency Path) -- notify once
+            consistency_ok = (acc.profit_since_payout > 0
+                              and acc.max_day_pnl_since_payout
+                                  <= acc.profit_since_payout * CONSISTENCY_PCT)
             if (acc.phase == Phase.FUNDED
                     and acc.winning_days >= WINNING_DAYS_REQUIRED
-                    and acc.profit_since_payout > 0
+                    and consistency_ok
                     and not acc._payout_notified):
                 acc._payout_notified = True
                 self._notify_payout_ready(acc)
@@ -2572,7 +2600,7 @@ Reads API_KEY from .env file (or --config / TOPSTEPX_API_KEY env var).
         f"Trade cap: {EVAL_CONFIG['max_trades_per_session']}"
         f"/session (resets each session), "
         f"cd={LOSS_COOLDOWN_MINUTES}min\n"
-        "Funded: coast mode (reduced risk after threshold)\n"
+        "Funded: Consistency Path payout rules\n"
         f"Telegram: {tg_str}\n\n"
         "Data feed: SignalR WebSocket (real-time) + REST "
         "fallback\n"
