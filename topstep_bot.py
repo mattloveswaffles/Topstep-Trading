@@ -177,6 +177,7 @@ FUNDED_CONFIG = {
 
 LOSS_COOLDOWN_MINUTES = 180    # block entries for 3 hours after a loss
 STUCK_TRADE_TIMEOUT_SECS = 300 # force-clear _trade_active if stuck this long
+PENDING_EXIT_TIMEOUT_SECS = 60 # fall back to REST if RT trade event missed
 MIN_EXIT_GAP_SECS = 30         # min seconds between exit and next entry
 
 
@@ -1524,45 +1525,91 @@ class TradingEngine:
         self._start_realtime()
 
     def _startup_cooldown_check(self):
-        """On startup, check the most recent trade. If it was a loss, apply cooldown."""
+        """On startup, check the most recent closing trade.
+
+        If it was a loss, still within the same session, and less than
+        LOSS_COOLDOWN_MINUTES ago, apply the remaining cooldown.
+        """
         try:
             now = self._now_et()
-            today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+            current_session = get_current_session(now)
+            today_start = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT00:00:00Z"
+            )
 
             for acc in self.accounts.values():
-                trades = self.api.get_trades(acc.account_id, today_start)
+                # Set current session so the first loop tick doesn't
+                # treat it as a session change and wipe our cooldown
+                acc.current_session = current_session
+
+                trades = self.api.get_trades(
+                    acc.account_id, today_start
+                )
                 if not trades:
                     continue
 
-                trades_sorted = sorted(trades, key=self._parse_trade_timestamp)
-                last_trade = trades_sorted[-1]
-                pnl = last_trade.get("profitAndLoss")
-                fees = float(last_trade.get("fees", 0))
+                # Find the most recent closing trade (has PnL)
+                closing = [
+                    t for t in trades
+                    if t.get("profitAndLoss") is not None
+                ]
+                closing.sort(
+                    key=self._parse_trade_timestamp, reverse=True
+                )
 
-                if pnl is not None:
-                    net_pnl = float(pnl) - fees
-                    last_ts = self._parse_trade_timestamp(last_trade)
-                    minutes_ago = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
+                if closing:
+                    last = closing[0]
+                    pnl = float(last["profitAndLoss"])
+                    fees = float(last.get("fees", 0))
+                    net_pnl = pnl - fees
+                    last_ts = self._parse_trade_timestamp(last)
+                    last_et = last_ts.astimezone(ET)
+                    trade_session = get_current_session(last_et)
+                    mins_ago = (
+                        datetime.now(timezone.utc) - last_ts
+                    ).total_seconds() / 60
 
-                    if net_pnl < 0 and minutes_ago < LOSS_COOLDOWN_MINUTES:
-                        remaining = LOSS_COOLDOWN_MINUTES - minutes_ago
-                        acc.cooldown_until = now + timedelta(minutes=remaining)
+                    if (net_pnl < 0
+                            and mins_ago < LOSS_COOLDOWN_MINUTES
+                            and trade_session == current_session
+                            and current_session is not None):
+                        remaining = LOSS_COOLDOWN_MINUTES - mins_ago
+                        acc.cooldown_until = now + timedelta(
+                            minutes=remaining
+                        )
                         acc.last_exit_time = now
                         log.info(
-                            f"Startup cooldown: acct {acc.account_id} | last trade was "
-                            f"${net_pnl:+.2f} ({minutes_ago:.0f}min ago) | "
-                            f"cooldown until {acc.cooldown_until.strftime('%H:%M')}"
+                            f"Startup cooldown: acct {acc.account_id} "
+                            f"| last trade ${net_pnl:+.2f} "
+                            f"({mins_ago:.0f}min ago, {trade_session}) "
+                            f"| cooldown until "
+                            f"{acc.cooldown_until.strftime('%H:%M')}"
                         )
                     elif net_pnl < 0:
-                        log.info(f"Startup: acct {acc.account_id} | last trade was loss ${net_pnl:+.2f} but {LOSS_COOLDOWN_MINUTES}min already elapsed")
+                        log.info(
+                            f"Startup: acct {acc.account_id} "
+                            f"| last loss ${net_pnl:+.2f} "
+                            f"({mins_ago:.0f}min ago, {trade_session}) "
+                            f"| session={'same' if trade_session == current_session else 'changed'} "
+                            f"| no cooldown"
+                        )
                     else:
-                        log.info(f"Startup: acct {acc.account_id} | last trade was ${net_pnl:+.2f} -- no cooldown needed")
+                        log.info(
+                            f"Startup: acct {acc.account_id} "
+                            f"| last trade ${net_pnl:+.2f} "
+                            f"| no cooldown"
+                        )
 
                 # Populate rt_trades_today for dashboard
-                acc.rt_trades_today = [t for t in trades if t.get("profitAndLoss") is not None]
+                acc.rt_trades_today = [
+                    t for t in trades
+                    if t.get("profitAndLoss") is not None
+                ]
                 acc.trades_today = len(acc.rt_trades_today)
         except Exception as e:
-            log.warning(f"Startup cooldown check failed: {e}", exc_info=True)
+            log.warning(
+                f"Startup cooldown check failed: {e}", exc_info=True
+            )
 
     @staticmethod
     def _parse_trade_timestamp(trade: dict) -> datetime:
@@ -1708,6 +1755,69 @@ class TradingEngine:
         if order_type == OrderType.STOP and order_id and acc.position != 0:
             acc.stop_order_id = int(order_id)
             log.info(f"Captured stop order ID: {order_id} for acct {acc_id}")
+
+    def _resolve_pending_exit(self, acc: AccountState):
+        """Fallback: resolve PENDING_EXIT via REST API when RT trade event was missed."""
+        now = self._now_et()
+        acc_id = acc.account_id
+        log.warning(f"Pending exit timeout ({PENDING_EXIT_TIMEOUT_SECS}s) — resolving via REST for acct {acc_id}")
+
+        # Fetch recent trades to find the closing trade's PnL
+        start_ts = (now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            trades = self.api.get_trades(acc_id, start_ts)
+        except Exception as e:
+            log.error(f"REST trade fetch failed for acct {acc_id}: {e}")
+            trades = []
+
+        # Skip trades already processed via RT (match by trade id)
+        seen_ids = {t.get("id") for t in acc.rt_trades_today if t.get("id")}
+
+        # Find the most recent closing trade not already processed
+        closing_trades = [
+            t for t in (trades or [])
+            if t.get("profitAndLoss") is not None
+            and t.get("id") not in seen_ids
+        ]
+        closing_trades.sort(
+            key=lambda t: t.get("creationTimestamp", ""), reverse=True
+        )
+
+        net = None
+        if closing_trades:
+            t = closing_trades[0]
+            pnl = t.get("profitAndLoss")
+            fees = float(t.get("fees", 0))
+            net = float(pnl) - fees
+            acc.daily_pnl += net
+            acc.profit_since_payout += net
+            acc.max_day_pnl_since_payout = max(
+                acc.max_day_pnl_since_payout, acc.daily_pnl
+            )
+            acc.rt_trades_today.append(t)
+            acc.session_trades_log.append(t)
+            log.info(
+                f"REST resolved: acct {acc_id} | "
+                f"net=${net:+,.2f} | day=${acc.daily_pnl:+,.2f}"
+            )
+            pnl_style = "green" if net >= 0 else "red"
+            self._log_activity(
+                f"Trade closed (REST): ${net:+,.2f} "
+                f"(day: ${acc.daily_pnl:+,.2f})", pnl_style
+            )
+
+        acc._pending_exit_cooldown = False
+        acc._trade_active = False
+
+        if net is not None and net < 0:
+            acc.apply_loss_cooldown(now)
+            log.info(f"Loss cooldown: acct {acc_id} | no entries until {acc.cooldown_until.strftime('%H:%M')}")
+            self._log_activity(f"Cooldown until {acc.cooldown_until.strftime('%H:%M')} ({LOSS_COOLDOWN_MINUTES}min)", "yellow")
+        elif net is None:
+            # Couldn't find PnL — apply cooldown conservatively
+            log.warning(f"Could not resolve PnL for acct {acc_id} — applying conservative cooldown")
+            acc.apply_loss_cooldown(now)
+            self._log_activity(f"Cooldown (unknown PnL) until {acc.cooldown_until.strftime('%H:%M')}", "yellow")
 
     def _cancel_stale_orders(self, acc: AccountState):
         """Cancel any remaining bracket orders after position goes flat."""
@@ -2119,7 +2229,13 @@ class TradingEngine:
                     acc._trade_active = False
                     acc._pending_exit_cooldown = False
                     acc.apply_loss_cooldown(now)
-                    # Re-check after clearing
+                    guard = acc.entry_blocked(now)
+
+        if guard == EntryGuard.PENDING_EXIT:
+            if acc.last_exit_time is not None:
+                pending_secs = (now - acc.last_exit_time).total_seconds()
+                if pending_secs > PENDING_EXIT_TIMEOUT_SECS:
+                    self._resolve_pending_exit(acc)
                     guard = acc.entry_blocked(now)
 
         if guard != EntryGuard.CLEAR:
@@ -2297,6 +2413,13 @@ class TradingEngine:
                     acc._trade_active = False
                     acc._pending_exit_cooldown = False
                     acc.apply_loss_cooldown(now)
+                    guard = acc.entry_blocked(now)
+
+        if guard == EntryGuard.PENDING_EXIT:
+            if acc.last_exit_time is not None:
+                pending_secs = (now - acc.last_exit_time).total_seconds()
+                if pending_secs > PENDING_EXIT_TIMEOUT_SECS:
+                    self._resolve_pending_exit(acc)
                     guard = acc.entry_blocked(now)
 
         if guard != EntryGuard.CLEAR:
