@@ -13,6 +13,9 @@ POINT_VALUE = 20.0
 # Default contracts per trade for the strategy (must be <= MAX_CONTRACTS)
 DEFAULT_CONTRACTS = 1
 
+# Round-trip fee per trade (exchange + clearing + NFA + platform)
+FEE_PER_TRADE = 3.00
+
 
 def infer_bar_minutes(df: pd.DataFrame, timestamp_col: str = "datetime") -> int:
     """Infer bar size in minutes from the first two rows."""
@@ -330,7 +333,7 @@ def run_vwap_micro_momentum_topstep(
         if not in_session:
             if position != 0 and entry_price is not None:
                 exit_price = c
-                pnl = (exit_price - entry_price) * point_value * contracts * position
+                pnl = (exit_price - entry_price) * point_value * contracts * position - FEE_PER_TRADE
                 cum_pnl += pnl
                 trades.append({
                     "timestamp": ts, "instrument": "NQ", "entry_price": entry_price,
@@ -435,7 +438,7 @@ def run_vwap_micro_momentum_topstep(
                     exit_price = c
 
         if exit_now and exit_price is not None:
-            pnl = (exit_price - entry_price) * point_value * contracts * position
+            pnl = (exit_price - entry_price) * point_value * contracts * position - FEE_PER_TRADE
             cum_pnl += pnl
             trades.append({
                 "timestamp": ts, "instrument": "NQ", "entry_price": entry_price,
@@ -700,9 +703,9 @@ def run_topstep_nq(
             if position != 0 and entry_price is not None:
                 exit_price = c
                 if position > 0:
-                    pnl = (exit_price - entry_price) * point_value * abs(position)
+                    pnl = (exit_price - entry_price) * point_value * abs(position) - FEE_PER_TRADE
                 else:
-                    pnl = (entry_price - exit_price) * point_value * abs(position)
+                    pnl = (entry_price - exit_price) * point_value * abs(position) - FEE_PER_TRADE
                 cum_pnl += pnl
                 day_realized_pnl += pnl
                 duration_min = (ts - entry_ts).total_seconds() / 60.0 if entry_ts is not None else 0.0
@@ -941,7 +944,7 @@ def run_topstep_nq(
                         scale_contracts = min(partial_exit_contracts, abs(position) - 1)
                         partial_pnl = (
                             (partial_target_level - entry_price) * point_value * scale_contracts
-                        )
+                        ) - FEE_PER_TRADE
                         cum_pnl += partial_pnl
                         day_realized_pnl += partial_pnl
                         trades.append({
@@ -997,7 +1000,7 @@ def run_topstep_nq(
                         scale_contracts = min(partial_exit_contracts, abs(position) - 1)
                         partial_pnl = (
                             (entry_price - partial_target_level) * point_value * scale_contracts
-                        )
+                        ) - FEE_PER_TRADE
                         cum_pnl += partial_pnl
                         day_realized_pnl += partial_pnl
                         trades.append({
@@ -1043,9 +1046,9 @@ def run_topstep_nq(
 
         if exit_now and exit_price is not None:
             if is_long:
-                pnl = (exit_price - entry_price) * point_value * abs(position)
+                pnl = (exit_price - entry_price) * point_value * abs(position) - FEE_PER_TRADE
             else:
-                pnl = (entry_price - exit_price) * point_value * abs(position)
+                pnl = (entry_price - exit_price) * point_value * abs(position) - FEE_PER_TRADE
             cum_pnl += pnl
             day_realized_pnl += pnl
             duration_min = (ts - entry_ts).total_seconds() / 60.0 if entry_ts is not None else 0.0
@@ -1200,7 +1203,7 @@ def run_momentum_breakout_volume_validated(
                     exit_time = ts
 
         if exit_now and exit_price is not None and exit_time is not None:
-            pnl = (exit_price - entry_price) * point_value * contracts
+            pnl = (exit_price - entry_price) * point_value * contracts - FEE_PER_TRADE
             cum_pnl += pnl
             trades.append({
                 "timestamp": exit_time,
