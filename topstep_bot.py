@@ -250,7 +250,6 @@ def _build_telegram_notifier() -> Optional[TelegramNotifier]:
     if not token:
         return None
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    log.info(f"Telegram notifications enabled (chat_id={'set' if chat_id else 'auto-discover'})")
     return TelegramNotifier(token, chat_id)
 
 
@@ -1406,6 +1405,13 @@ class TradingEngine:
 
     # -- Telegram Helpers --------------------------------------------------
 
+    def _calc_dd_left(self, acc: AccountState) -> float:
+        """Calculate remaining drawdown for an account."""
+        if acc.phase == Phase.FUNDED and acc.has_taken_payout:
+            return min(acc.equity, FUNDED_TRAILING_DD - (acc.peak - acc.equity))
+        max_dd = EVAL_TRAILING_DD if acc.phase == Phase.EVAL else FUNDED_TRAILING_DD
+        return max_dd - (acc.peak - acc.equity)
+
     def _notify_session_end(self, acc: AccountState, ended_session: str):
         """Send Telegram summary when a trading session ends."""
         if _telegram is None:
@@ -1413,33 +1419,48 @@ class TradingEngine:
 
         phase_str = acc.phase.value.upper()
         trades = acc.session_trades_log
-        session_pnl = sum(float(t.get("profitAndLoss", 0)) - float(t.get("fees", 0)) for t in trades)
+        session_pnl = sum(
+            float(t.get("profitAndLoss", 0)) - float(t.get("fees", 0))
+            for t in trades
+        )
+        pnl_emoji = "🟢" if session_pnl >= 0 else "🔴"
 
         lines = [
-            f"<b>Session End: {ended_session}</b>",
-            f"Account: {acc.name}",
-            f"Phase: {phase_str}",
-            f"Session PnL: <b>${session_pnl:+,.2f}</b>",
-            f"Trades: {len(trades)}",
+            f"📊 <b>{ended_session} Session Recap</b>",
+            "",
+            f"🏷 <b>Account:</b> {acc.name}",
+            f"📋 <b>Phase:</b> {phase_str}",
+            f"{pnl_emoji} <b>Session PnL:</b> ${session_pnl:+,.2f}",
+            f"🔢 <b>Trades:</b> {len(trades)}",
         ]
 
-        for i, t in enumerate(trades, 1):
-            ts_raw = t.get("creationTimestamp") or t.get("timestamp", "")
-            try:
-                ts = pd.to_datetime(ts_raw)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                time_str = ts.astimezone(ET).strftime("%I:%M %p")
-            except Exception:
-                time_str = "?"
-            pnl = float(t.get("profitAndLoss", 0))
-            fees = float(t.get("fees", 0))
-            net = pnl - fees
-            side_str = "SELL" if t.get("side") == 0 else "BUY"
-            lines.append(f"  {i}. {time_str} {side_str} → ${net:+,.2f}")
+        if trades:
+            lines.append("")
+            for i, t in enumerate(trades, 1):
+                ts_raw = (
+                    t.get("creationTimestamp") or t.get("timestamp", "")
+                )
+                try:
+                    ts = pd.to_datetime(ts_raw)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    time_str = ts.astimezone(ET).strftime("%I:%M %p")
+                except Exception:
+                    time_str = "?"
+                pnl = float(t.get("profitAndLoss", 0))
+                fees = float(t.get("fees", 0))
+                net = pnl - fees
+                side_str = "SELL" if t.get("side") == 0 else "BUY"
+                t_emoji = "✅" if net >= 0 else "❌"
+                lines.append(
+                    f"  {t_emoji} {time_str} {side_str} → "
+                    f"<b>${net:+,.2f}</b>"
+                )
 
-        lines.append(f"\nDay PnL: ${acc.daily_pnl:+,.2f}")
-        lines.append(f"Equity: ${acc.equity:+,.2f}")
+        lines.append("")
+        lines.append(f"📈 <b>Day PnL:</b> ${acc.daily_pnl:+,.2f}")
+        lines.append(f"💵 <b>Equity:</b> ${acc.equity:,.2f}")
+        lines.append(f"🛡 <b>DD Left:</b> ${self._calc_dd_left(acc):,.2f}")
 
         _telegram.send("\n".join(lines))
 
@@ -1448,11 +1469,13 @@ class TradingEngine:
         if _telegram is None:
             return
         _telegram.send(
-            f"🎉 <b>EVAL PASSED!</b>\n"
-            f"Account: {acc.name}\n"
-            f"Equity: ${acc.equity:+,.2f}\n"
-            f"Trading Days: {acc.trading_days}\n\n"
-            f"Account is now ready to transition to FUNDED!"
+            f"🎉🎉🎉 <b>EVAL PASSED!</b> 🎉🎉🎉\n"
+            f"\n"
+            f"🏷 <b>Account:</b> {acc.name}\n"
+            f"💵 <b>Equity:</b> ${acc.equity:,.2f}\n"
+            f"📅 <b>Trading Days:</b> {acc.trading_days}\n"
+            f"\n"
+            f"🚀 Account is now ready to transition to <b>FUNDED</b>!"
         )
 
     def _notify_payout_ready(self, acc: AccountState):
@@ -1462,14 +1485,19 @@ class TradingEngine:
         gross_payout = min(acc.profit_since_payout * PAYOUT_BAL_PCT, PAYOUT_MAX)
         net_payout = gross_payout * 0.90  # 90/10 split
         _telegram.send(
-            f"💰 <b>PAYOUT READY!</b> (Consistency Path)\n"
-            f"Account: {acc.name}\n"
-            f"Winning Days: {acc.winning_days}/{WINNING_DAYS_REQUIRED}\n"
-            f"Profit Since Payout: ${acc.profit_since_payout:+,.2f}\n"
-            f"Max Day: ${acc.max_day_pnl_since_payout:,.2f} "
-            f"(limit: ${acc.profit_since_payout * CONSISTENCY_PCT:,.2f})\n"
-            f"Request Payout: ${gross_payout:,.2f}\n"
-            f"You Receive: ${net_payout:,.2f} (90/10 split)"
+            f"💰💰💰 <b>PAYOUT READY!</b> 💰💰💰\n"
+            f"\n"
+            f"🏷 <b>Account:</b> {acc.name}\n"
+            f"📋 <b>Path:</b> Consistency\n"
+            f"✅ <b>Winning Days:</b> {acc.winning_days}/{WINNING_DAYS_REQUIRED}\n"
+            f"📈 <b>Profit:</b> ${acc.profit_since_payout:+,.2f}\n"
+            f"📊 <b>40% Rule:</b> ${acc.max_day_pnl_since_payout:,.2f}"
+            f" / ${acc.profit_since_payout * CONSISTENCY_PCT:,.2f} ✅\n"
+            f"\n"
+            f"💵 <b>Request Payout:</b> ${gross_payout:,.2f}\n"
+            f"🤑 <b>You Receive:</b> ${net_payout:,.2f} (90/10 split)\n"
+            f"\n"
+            f"⚠️ <i>Trading paused until payout is processed.</i>"
         )
 
     # -- Setup -------------------------------------------------------------
