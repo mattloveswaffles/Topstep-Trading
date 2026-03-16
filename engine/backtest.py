@@ -13,8 +13,8 @@ POINT_VALUE = 20.0
 # Default contracts per trade for the strategy (must be <= MAX_CONTRACTS)
 DEFAULT_CONTRACTS = 1
 
-# Round-trip fee per trade (exchange + clearing + NFA + platform)
-FEE_PER_TRADE = 3.00
+# Round-trip fee per trade ($3 per side x 2 = $6 per round-trip)
+FEE_PER_TRADE = 6.00
 
 
 def infer_bar_minutes(df: pd.DataFrame, timestamp_col: str = "datetime") -> int:
