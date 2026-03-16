@@ -176,7 +176,6 @@ FUNDED_CONFIG = {
 }
 
 LOSS_COOLDOWN_MINUTES = 180    # block entries for 3 hours after a loss
-STUCK_TRADE_TIMEOUT_SECS = 300 # force-clear _trade_active if stuck this long
 PENDING_EXIT_TIMEOUT_SECS = 60 # fall back to REST if RT trade event missed
 MIN_EXIT_GAP_SECS = 30         # min seconds between exit and next entry
 
@@ -1715,11 +1714,13 @@ class TradingEngine:
             acc.entry_price = float(avg_price)
 
         if new_size == 0:
-            # Position went flat on exchange -- block entries until RT trade confirms PnL
+            # Position went flat -- clear trade_active, try to resolve PnL immediately
             if was_in_position:
+                acc._trade_active = False
                 acc._pending_exit_cooldown = True
                 acc.last_exit_time = self._now_et()
                 self._cancel_stale_orders(acc)
+                self._resolve_pending_exit(acc)
             acc.clear_position_state()
 
     def _on_rt_trade(self, data: dict):
@@ -1789,10 +1790,16 @@ class TradingEngine:
             log.info(f"Captured stop order ID: {order_id} for acct {acc_id}")
 
     def _resolve_pending_exit(self, acc: AccountState):
-        """Fallback: resolve PENDING_EXIT via REST API when RT trade event was missed."""
+        """Resolve PENDING_EXIT via REST API when RT trade event was missed.
+
+        Called immediately when position goes flat (from RT position or API sync)
+        and again on each poll cycle if the first attempt didn't find the trade yet.
+        If REST can't find the closing trade, leaves _pending_exit_cooldown on so
+        the next poll cycle retries.
+        """
         now = self._now_et()
         acc_id = acc.account_id
-        log.warning(f"Pending exit timeout ({PENDING_EXIT_TIMEOUT_SECS}s) — resolving via REST for acct {acc_id}")
+        log.info(f"Resolving pending exit via REST for acct {acc_id}")
 
         # Fetch recent trades to find the closing trade's PnL
         start_ts = (now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -1838,18 +1845,27 @@ class TradingEngine:
                 f"(day: ${acc.daily_pnl:+,.2f})", pnl_style
             )
 
-        acc._pending_exit_cooldown = False
-        acc._trade_active = False
-
-        if net is not None and net < 0:
-            acc.apply_loss_cooldown(now)
-            log.info(f"Loss cooldown: acct {acc_id} | no entries until {acc.cooldown_until.strftime('%H:%M')}")
-            self._log_activity(f"Cooldown until {acc.cooldown_until.strftime('%H:%M')} ({LOSS_COOLDOWN_MINUTES}min)", "yellow")
-        elif net is None:
-            # Couldn't find PnL — apply cooldown conservatively
-            log.warning(f"Could not resolve PnL for acct {acc_id} — applying conservative cooldown")
-            acc.apply_loss_cooldown(now)
-            self._log_activity(f"Cooldown (unknown PnL) until {acc.cooldown_until.strftime('%H:%M')}", "yellow")
+        if net is not None:
+            # Trade found -- clear the pending exit guard
+            acc._pending_exit_cooldown = False
+            acc._trade_active = False
+            if net < 0:
+                acc.apply_loss_cooldown(now)
+                log.info(f"Loss cooldown: acct {acc_id} | no entries until {acc.cooldown_until.strftime('%H:%M')}")
+                self._log_activity(f"Cooldown until {acc.cooldown_until.strftime('%H:%M')} ({LOSS_COOLDOWN_MINUTES}min)", "yellow")
+        else:
+            # Trade not found yet -- leave _pending_exit_cooldown on so next poll retries.
+            # Safety valve: if we've been waiting too long, clear with conservative cooldown.
+            if acc.last_exit_time is not None:
+                wait_secs = (now - acc.last_exit_time).total_seconds()
+                if wait_secs > PENDING_EXIT_TIMEOUT_SECS:
+                    log.warning(f"Could not resolve PnL for acct {acc_id} after {wait_secs:.0f}s — applying conservative cooldown")
+                    acc._pending_exit_cooldown = False
+                    acc._trade_active = False
+                    acc.apply_loss_cooldown(now)
+                    self._log_activity(f"Cooldown (unknown PnL) until {acc.cooldown_until.strftime('%H:%M')}", "yellow")
+                else:
+                    log.info(f"Trade not found yet for acct {acc_id} — will retry on next poll")
 
     def _cancel_stale_orders(self, acc: AccountState):
         """Cancel any remaining bracket orders after position goes flat."""
@@ -1984,10 +2000,17 @@ class TradingEngine:
         else:
             if acc.position != 0:
                 log.warning("API sync: no NQ position, syncing to flat")
+                acc._trade_active = False
                 acc._pending_exit_cooldown = True
                 acc.last_exit_time = self._now_et()
-            acc.position = 0
-            acc.entry_price = 0.0
+                self._cancel_stale_orders(acc)
+                acc.position = 0
+                acc.entry_price = 0.0
+                acc.clear_position_state()
+                self._resolve_pending_exit(acc)
+            else:
+                acc.position = 0
+                acc.entry_price = 0.0
 
     def _recover_stop_order(self, acc: AccountState, nq_pos: dict):
         """Try to recover the stop order ID and entry price after a reconnect."""
@@ -2215,7 +2238,7 @@ class TradingEngine:
         session_name = get_current_session(now)
         if session_name != acc.current_session:
             prev_session = acc.current_session
-            if prev_session is not None and acc.session_trades_log:
+            if prev_session is not None:
                 self._notify_session_end(acc, prev_session)
             if session_name is not None:
                 log.info(
@@ -2251,27 +2274,10 @@ class TradingEngine:
         # Consolidated entry guard check
         guard = acc.entry_blocked(now)
 
-        if guard == EntryGuard.TRADE_ACTIVE:
-            # Safety release: if position is flat and stuck for too long,
-            # assume WebSocket missed the trade event -- apply conservative cooldown
-            if acc.position == 0 and acc.last_exit_time is not None:
-                stuck_seconds = (now - acc.last_exit_time).total_seconds()
-                if stuck_seconds > STUCK_TRADE_TIMEOUT_SECS:
-                    log.warning(
-                        f"_trade_active stuck for {stuck_seconds:.0f}s -- "
-                        f"force-clearing with {LOSS_COOLDOWN_MINUTES}min cooldown"
-                    )
-                    acc._trade_active = False
-                    acc._pending_exit_cooldown = False
-                    acc.apply_loss_cooldown(now)
-                    guard = acc.entry_blocked(now)
-
         if guard == EntryGuard.PENDING_EXIT:
-            if acc.last_exit_time is not None:
-                pending_secs = (now - acc.last_exit_time).total_seconds()
-                if pending_secs > PENDING_EXIT_TIMEOUT_SECS:
-                    self._resolve_pending_exit(acc)
-                    guard = acc.entry_blocked(now)
+            # Retry REST resolution on each poll cycle
+            self._resolve_pending_exit(acc)
+            guard = acc.entry_blocked(now)
 
         if guard != EntryGuard.CLEAR:
             return
@@ -2401,7 +2407,7 @@ class TradingEngine:
         session_name = get_current_session(now)
         if session_name != acc.current_session:
             prev_session = acc.current_session
-            if prev_session is not None and acc.session_trades_log:
+            if prev_session is not None:
                 self._notify_session_end(acc, prev_session)
             if session_name is not None:
                 log.info(
@@ -2437,25 +2443,10 @@ class TradingEngine:
         # Consolidated entry guard check
         guard = acc.entry_blocked(now)
 
-        if guard == EntryGuard.TRADE_ACTIVE:
-            if acc.position == 0 and acc.last_exit_time is not None:
-                stuck_seconds = (now - acc.last_exit_time).total_seconds()
-                if stuck_seconds > STUCK_TRADE_TIMEOUT_SECS:
-                    log.warning(
-                        f"_trade_active stuck for {stuck_seconds:.0f}s -- "
-                        f"force-clearing with {LOSS_COOLDOWN_MINUTES}min cooldown"
-                    )
-                    acc._trade_active = False
-                    acc._pending_exit_cooldown = False
-                    acc.apply_loss_cooldown(now)
-                    guard = acc.entry_blocked(now)
-
         if guard == EntryGuard.PENDING_EXIT:
-            if acc.last_exit_time is not None:
-                pending_secs = (now - acc.last_exit_time).total_seconds()
-                if pending_secs > PENDING_EXIT_TIMEOUT_SECS:
-                    self._resolve_pending_exit(acc)
-                    guard = acc.entry_blocked(now)
+            # Retry REST resolution on each poll cycle
+            self._resolve_pending_exit(acc)
+            guard = acc.entry_blocked(now)
 
         if guard != EntryGuard.CLEAR:
             return
