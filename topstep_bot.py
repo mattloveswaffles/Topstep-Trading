@@ -2132,6 +2132,23 @@ class TradingEngine:
             return (et_dt + timedelta(days=1)).date()
         return et_dt.date()
 
+    def _check_contract_rollover(self):
+        """Check if the NQ contract has rolled over and update if needed."""
+        try:
+            nq = self.api.get_nq_contract()
+            if not nq:
+                return
+            new_id = nq.get("id", "")
+            if new_id and new_id != self.contract_id:
+                old_id = self.contract_id
+                self.contract_id = new_id
+                self.contract_name = nq.get("name", "")
+                for acc in self.accounts.values():
+                    acc.contract_id = new_id
+                log.info(f"Contract rolled over: {old_id} -> {new_id} ({self.contract_name})")
+        except Exception as e:
+            log.warning(f"Contract rollover check failed: {e}")
+
     def _refresh_daily_bars(self):
         """Fetch historical 5m bars and aggregate to daily OHLCV for prev-day close."""
         try:
@@ -2573,6 +2590,7 @@ class TradingEngine:
 
                         if time.time() - last_daily_refresh > 1800:
                             self._refresh_daily_bars()
+                            self._check_contract_rollover()
                             last_daily_refresh = time.time()
 
                         self.api.ensure_auth()
