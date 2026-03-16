@@ -1912,6 +1912,8 @@ class TradingEngine:
                 acc.today = data.get("today", "")
                 acc.daily_pnl = data.get("daily_pnl", 0)
                 acc.trades_today = data.get("trades_today", 0)
+                acc.current_session = data.get("current_session")
+                acc.trades_this_session = data.get("trades_this_session", 0)
                 acc.phase = Phase(data.get("phase", "eval"))
             log.info("Loaded saved state")
         except Exception as e:
@@ -1935,6 +1937,8 @@ class TradingEngine:
                 "today": acc.today,
                 "daily_pnl": acc.daily_pnl,
                 "trades_today": acc.trades_today,
+                "current_session": acc.current_session,
+                "trades_this_session": acc.trades_this_session,
             }
         with open(self.state_file, "w") as f:
             json.dump(data, f, indent=2)
