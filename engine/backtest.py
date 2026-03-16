@@ -1251,12 +1251,18 @@ COMBINE_COST = 49.0
 def _precompute_day_stats(
     day_trades: List[pd.DataFrame],
     day1_profit_cap: float = 1400.0,
+    max_adverse_per_trade: float = 0.0,
 ) -> Dict[str, np.ndarray]:
     """Pre-compute per-day statistics for vectorized Monte Carlo.
 
     For each historical trading day, compute:
     - full_* : stats with daily-loss-limit cap applied (stop trading at -$1K)
     - cap_*  : stats with BOTH day1 profit cap AND daily-loss-limit cap
+
+    max_adverse_per_trade: worst unrealized loss possible during any trade
+    (stop_pts × point_value × contracts + fees). Used to adjust min_cum
+    so that winning trades that dipped near the stop are accounted for
+    in the trailing DD bust check.
 
     Daily loss limit does NOT bust the account — it just stops trading for
     the day and caps PnL at -DAILY_LOSS_LIMIT.
@@ -1294,9 +1300,19 @@ def _precompute_day_stats(
         lrmax = np.maximum.accumulate(lcum)
         ldd = lrmax - lcum
         out["full_pnl"][d] = lcum[-1]
-        out["full_min_cum"][d] = lcum.min()
         out["full_max_cum"][d] = lrmax[-1]
         out["full_intra_dd"][d] = ldd.max()
+
+        # Adjust min_cum for unrealized adverse excursion during trades.
+        # Before each trade resolves, unrealized PnL could dip by max_adverse.
+        if max_adverse_per_trade > 0:
+            pre_cum = np.empty(n_take_loss)
+            pre_cum[0] = 0.0
+            pre_cum[1:] = lcum[:-1]
+            worst_unrealized = pre_cum - max_adverse_per_trade
+            out["full_min_cum"][d] = min(lcum.min(), worst_unrealized.min())
+        else:
+            out["full_min_cum"][d] = lcum.min()
 
         # --- Day1 profit cap + daily loss cap ---
         pre_trade = np.empty(len(pnls))
@@ -1320,9 +1336,17 @@ def _precompute_day_stats(
         crmax = np.maximum.accumulate(ccum)
         cdd = crmax - ccum
         out["cap_pnl"][d] = ccum[-1]
-        out["cap_min_cum"][d] = ccum.min()
         out["cap_max_cum"][d] = crmax[-1]
         out["cap_intra_dd"][d] = cdd.max()
+
+        if max_adverse_per_trade > 0:
+            pre_cum_c = np.empty(n_take)
+            pre_cum_c[0] = 0.0
+            pre_cum_c[1:] = ccum[:-1]
+            worst_unreal_c = pre_cum_c - max_adverse_per_trade
+            out["cap_min_cum"][d] = min(ccum.min(), worst_unreal_c.min())
+        else:
+            out["cap_min_cum"][d] = ccum.min()
 
     return out
 
@@ -1440,6 +1464,7 @@ def monte_carlo_topstep(
     day1_profit_cap: float = 1400.0,
     total_calendar_days: int = 0,
     total_data_days: int = 0,
+    max_adverse_per_trade: float = 0.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Numba-JIT Monte Carlo simulation of Topstep Combine attempts.
@@ -1488,7 +1513,7 @@ def monte_carlo_topstep(
     else:
         flat_ratio = 0.0
 
-    stats = _precompute_day_stats(day_trades, day1_profit_cap)
+    stats = _precompute_day_stats(day_trades, day1_profit_cap, max_adverse_per_trade)
     N = n_simulations
     MAX_SIM_DAYS = 252
 

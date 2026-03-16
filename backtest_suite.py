@@ -42,6 +42,7 @@ from engine.backtest import (
     TRAILING_DRAWDOWN,
     DAILY_LOSS_LIMIT,
     POINT_VALUE,
+    FEE_PER_TRADE,
 )
 from engine.alpha import load_daily, signal_to_trades, ALPHAS
 
@@ -459,6 +460,7 @@ def run_eval_mc(
     total_calendar_days: int = 0,
     total_data_days: int = 0,
     n_sims: int = DEFAULT_SIMS,
+    max_adverse_per_trade: float = 0.0,
 ) -> Dict:
     """Run Monte Carlo eval simulation. Returns key metrics as dict."""
     if trades_df.empty:
@@ -472,6 +474,7 @@ def run_eval_mc(
         n_simulations=n_sims,
         total_calendar_days=total_calendar_days,
         total_data_days=total_data_days,
+        max_adverse_per_trade=max_adverse_per_trade,
     )
 
     passed = attempts_df[attempts_df["Result"] == "PASS"]
@@ -934,10 +937,15 @@ def evaluate_strategy(
     # Data days: days with actual market data (excludes weekends/holidays)
     total_data_days = df["datetime"].dt.date.nunique()
 
+    # Max unrealized adverse excursion per trade (for DD bust during open trades)
+    stop = strategy.trailing_stop_pts or strategy.stop_pts
+    max_adverse = stop * POINT_VALUE * strategy.contracts + FEE_PER_TRADE
+
     # Eval MC
     eval_mc = run_eval_mc(
         trades_df, total_calendar_days=total_cal_days,
         total_data_days=total_data_days, n_sims=n_eval_sims,
+        max_adverse_per_trade=max_adverse,
     )
 
     # Funded MC — Standard Path
@@ -1085,9 +1093,14 @@ def evaluate_combo(
     max_date = df["datetime"].dt.date.max()
     total_cal_days = (max_date - min_date).days + 1
     total_data_days = df["datetime"].dt.date.nunique()
+
+    eval_stop = eval_strategy.trailing_stop_pts or eval_strategy.stop_pts
+    eval_max_adverse = eval_stop * POINT_VALUE * eval_strategy.contracts + FEE_PER_TRADE
+
     eval_mc = run_eval_mc(
         eval_trades_df, total_calendar_days=total_cal_days,
         total_data_days=total_data_days, n_sims=n_eval_sims,
+        max_adverse_per_trade=eval_max_adverse,
     )
 
     # Run funded backtest (separate strategy)
@@ -1364,9 +1377,12 @@ def grid_search(
             continue
 
         stats = compute_trade_stats(trades_df)
+        grid_stop = s.trailing_stop_pts or s.stop_pts
+        grid_max_adverse = grid_stop * POINT_VALUE * s.contracts + FEE_PER_TRADE
         eval_mc = run_eval_mc(
             trades_df, total_calendar_days=total_cal_days,
             total_data_days=total_data_days, n_sims=n_sims,
+            max_adverse_per_trade=grid_max_adverse,
         )
         funded_mc = run_funded_mc(trades_df, n_sims=min(n_sims, 5000),
                                   total_calendar_days=total_cal_days, total_data_days=total_data_days)
@@ -1702,9 +1718,12 @@ def main():
         max_date = df["datetime"].dt.date.max()
         total_cal_days = (max_date - min_date).days + 1
         total_data_days = df["datetime"].dt.date.nunique()
+        coast_stop = strat.trailing_stop_pts or strat.stop_pts
+        coast_max_adverse = coast_stop * POINT_VALUE * strat.contracts + FEE_PER_TRADE
         eval_mc = run_eval_mc(
             trades_df, total_calendar_days=total_cal_days,
             total_data_days=total_data_days, n_sims=args.sims,
+            max_adverse_per_trade=coast_max_adverse,
         )
         pr = eval_mc["pass_rate"] / 100
 
