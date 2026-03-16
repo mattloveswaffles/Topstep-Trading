@@ -913,7 +913,7 @@ def _compute_day_bias(bars: List[Dict], config: dict) -> dict:
     first_window_close = None
 
     for b in bars:
-        dt = pd.to_datetime(b["t"])
+        dt = datetime.fromisoformat(b["t"])
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         dt_et = dt.astimezone(ET)
@@ -1533,17 +1533,21 @@ class TradingEngine:
         try:
             now = self._now_et()
             current_session = get_current_session(now)
-            today_start = datetime.now(timezone.utc).strftime(
-                "%Y-%m-%dT00:00:00Z"
+            # Look back 24h to catch trades from current trading day
+            # (trading day starts 6PM ET = could be previous UTC date)
+            lookback = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
             )
 
             for acc in self.accounts.values():
-                # Set current session so the first loop tick doesn't
-                # treat it as a session change and wipe our cooldown
+                # Set current session and today so _check_new_day()
+                # doesn't wipe cooldown on the first tick
                 acc.current_session = current_session
+                if not acc.today:
+                    acc.today = str(now.date())
 
                 trades = self.api.get_trades(
-                    acc.account_id, today_start
+                    acc.account_id, lookback
                 )
                 if not trades:
                     continue
@@ -2013,7 +2017,10 @@ class TradingEngine:
 
     def _sync_daily_pnl_from_api(self, acc: AccountState):
         """Sync daily PnL from trades (source of truth)."""
-        today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+        # Look back 24h to cover trading day (starts 6PM ET, could be prev UTC date)
+        today_start = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         trades = self.api.get_trades(acc.account_id, today_start)
         total_pnl = 0.0
         total_fees = 0.0
@@ -2085,7 +2092,7 @@ class TradingEngine:
 
             rows = []
             for b in raw_bars:
-                dt = pd.to_datetime(b["t"])
+                dt = datetime.fromisoformat(b["t"])
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 rows.append({
@@ -2132,7 +2139,7 @@ class TradingEngine:
             today_utc = datetime.now(timezone.utc).date()
             session_bars = []
             for b in raw_bars:
-                dt = pd.to_datetime(b["t"])
+                dt = datetime.fromisoformat(b["t"])
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 if dt.date() == today_utc:
