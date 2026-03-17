@@ -677,6 +677,12 @@ def run_topstep_nq(
     last_day: Optional[str] = None
     last_session_id: int = -1
     cooldown_until = None  # timestamp until which entries are blocked after a loss
+    # Pessimistic entry: defer to next bar's high (long) / low (short)
+    deferred_long = False
+    deferred_short = False
+    deferred_entry_contracts = 0
+    deferred_target_pts = None
+    deferred_a_plus = False
     n = len(df)
 
     for k in range(n):
@@ -699,7 +705,38 @@ def run_topstep_nq(
             cooldown_until = None  # reset cooldown on new session open
             last_session_id = cur_session_id
 
+        # Resolve deferred entries at this bar (pessimistic: high for longs, low for shorts)
+        if deferred_long and position == 0:
+            entry_price = h  # worst-case long fill = bar high
+            entry_ts = ts
+            position = deferred_entry_contracts
+            target_pts_for_trade = deferred_target_pts or target_pts
+            stop_level = entry_price - stop_pts
+            target_level = entry_price + target_pts_for_trade
+            partial_target_level = entry_price + (
+                partial_exit_pts if partial_exit_pts is not None else target_pts_for_trade / 2.0
+            )
+            partial_taken = False
+            highest_price_since_entry = h
+            deferred_long = False
+            deferred_short = False
+        elif deferred_short and position == 0:
+            entry_price = l_  # worst-case short fill = bar low
+            entry_ts = ts
+            position = -deferred_entry_contracts
+            target_pts_for_trade = deferred_target_pts or target_pts
+            stop_level = entry_price + stop_pts
+            target_level = entry_price - target_pts_for_trade
+            partial_target_level = entry_price - (
+                partial_exit_pts if partial_exit_pts is not None else target_pts_for_trade / 2.0
+            )
+            partial_taken = False
+            highest_price_since_entry = l_
+            deferred_short = False
+            deferred_long = False
+
         if not in_session:
+            deferred_long = deferred_short = False  # cancel deferred if session ends
             if position != 0 and entry_price is not None:
                 exit_price = c
                 if position > 0:
@@ -860,49 +897,33 @@ def run_topstep_nq(
                 pending_signal_prev_high = prev_high
                 long_signal = False
 
-        # Long entry
-        if position == 0 and can_trade and long_signal and entry_price is None:
+        # Long entry — defer to next bar (enter at next bar's high = pessimistic)
+        if position == 0 and can_trade and long_signal and entry_price is None and not deferred_long:
             entry_contracts = contracts
             if hybrid_sizing:
                 entry_contracts = contracts if a_plus_signal else base_contracts
             elif a_plus_only and a_plus_signal:
                 entry_contracts = contracts
-            position = entry_contracts
-            entry_price = c
-            entry_ts = ts
-            target_pts_for_trade = target_pts
+            deferred_long = True
+            deferred_entry_contracts = entry_contracts
+            deferred_target_pts = target_pts
             if adaptive_target and not pd.isna(atr) and not pd.isna(atr_ref):
-                target_pts_for_trade = (
+                deferred_target_pts = (
                     low_vol_target_pts if float(atr) <= float(atr_ref) else high_vol_target_pts
                 )
-            stop_level = entry_price - stop_pts
-            target_level = entry_price + target_pts_for_trade
-            partial_target_level = entry_price + (
-                partial_exit_pts if partial_exit_pts is not None else target_pts_for_trade / 2.0
-            )
-            partial_taken = False
-            highest_price_since_entry = h
 
-        # Short entry
-        if not long_only and position == 0 and can_trade and short_signal and entry_price is None:
+        # Short entry — defer to next bar (enter at next bar's low = pessimistic)
+        if not long_only and position == 0 and can_trade and short_signal and entry_price is None and not deferred_short:
             entry_contracts = contracts
             if hybrid_sizing:
                 entry_contracts = contracts if a_plus_signal else base_contracts
-            position = -entry_contracts
-            entry_price = c
-            entry_ts = ts
-            target_pts_for_trade = target_pts
+            deferred_short = True
+            deferred_entry_contracts = entry_contracts
+            deferred_target_pts = target_pts
             if adaptive_target and not pd.isna(atr) and not pd.isna(atr_ref):
-                target_pts_for_trade = (
+                deferred_target_pts = (
                     low_vol_target_pts if float(atr) <= float(atr_ref) else high_vol_target_pts
                 )
-            stop_level = entry_price + stop_pts       # stop above for shorts
-            target_level = entry_price - target_pts_for_trade  # target below for shorts
-            partial_target_level = entry_price - (
-                partial_exit_pts if partial_exit_pts is not None else target_pts_for_trade / 2.0
-            )
-            partial_taken = False
-            highest_price_since_entry = l_  # track lowest for shorts
 
         exit_now = False
         exit_price = None

@@ -143,6 +143,72 @@ register_strategy(
     },
 )
 
+register_strategy(
+    name="vwap_mr_no_trail",
+    description="VWAP Micro MR — No trailing stop, fixed 5pt SL",
+    strategy_type="vwap_micro",
+    stop_pts=5.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=15 * 60 + 45,
+    trailing_stop_pts=None,
+    long_only=False,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 1.5,
+        "min_down_bar_pts": 0.5,
+        "rsi_oversold_max": 50.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
+register_strategy(
+    name="vwap_mr_sl3",
+    description="VWAP Micro MR — 3pt SL, trail=2pt",
+    strategy_type="vwap_micro",
+    stop_pts=3.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=15 * 60 + 45,
+    trailing_stop_pts=2.0,
+    long_only=False,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 1.5,
+        "min_down_bar_pts": 0.5,
+        "rsi_oversold_max": 50.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
+register_strategy(
+    name="vwap_mr_sl4",
+    description="VWAP Micro MR — 4pt SL, trail=2pt",
+    strategy_type="vwap_micro",
+    stop_pts=4.0,
+    target_pts=20.0,
+    contracts=2,
+    session_start_min=9 * 60 + 30,
+    session_end_min=15 * 60 + 45,
+    trailing_stop_pts=2.0,
+    long_only=False,
+    params={
+        "vwap_micro_mean_reversion": True,
+        "high_prob_only": True,
+        "day_bias_filter": False,
+        "min_dip_pts": 1.5,
+        "min_down_bar_pts": 0.5,
+        "rsi_oversold_max": 50.0,
+        "rsi_overbought_min": 50.0,
+    },
+)
+
 # Alpha#44: -correlation(high, rank(volume), 5) — daily signal strategy
 register_strategy(
     name="alpha44",
@@ -1644,6 +1710,7 @@ def main():
     )
     parser.add_argument("--strategy", "-s", help="Run a single strategy by name")
     parser.add_argument("--grid", action="store_true", help="Run grid search")
+    parser.add_argument("--rsi-grid", action="store_true", help="Grid search RSI combos (use with --grid)")
     parser.add_argument("--split", action="store_true", help="Run split test (IS/OOS)")
     parser.add_argument("--combo", action="store_true", help="Test all eval/funded strategy combinations")
     parser.add_argument("--coast", action="store_true", help="Test funded coast mode variants")
@@ -1680,6 +1747,12 @@ def main():
             "min_dip_pts": [1.0, 1.5, 2.0],
             "min_down_bar_pts": [0.25, 0.5, 1.0],
         }
+        if args.rsi_grid:
+            param_grid = {
+                "rsi_oversold_max": [30.0, 35.0, 40.0, 45.0, 50.0],
+                "rsi_overbought_min": [50.0, 55.0, 60.0, 65.0, 70.0],
+                "trailing_stop_pts": [2.0, 3.0],
+            }
 
         grid_df = grid_search(df, base, param_grid, n_sims=args.sims, top_n=15, df_1m=df_1m)
         if not grid_df.empty:
