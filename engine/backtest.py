@@ -705,9 +705,14 @@ def run_topstep_nq(
             cooldown_until = None  # reset cooldown on new session open
             last_session_id = cur_session_id
 
-        # Resolve deferred entries at this bar (pessimistic: high for longs, low for shorts)
+        # Resolve deferred entries at this bar
+        # Use first 1m bar's high/low for realistic entry (not 5m bar extremes)
         if deferred_long and position == 0:
-            entry_price = h  # worst-case long fill = bar high
+            if _1m_bars_for_5m is not None and k in _1m_bars_for_5m:
+                s1, _ = _1m_bars_for_5m[k]
+                entry_price = float(_1m_high[s1])  # first 1m bar's high
+            else:
+                entry_price = h  # fallback to 5m bar high
             entry_ts = ts
             position = deferred_entry_contracts
             target_pts_for_trade = deferred_target_pts or target_pts
@@ -717,11 +722,15 @@ def run_topstep_nq(
                 partial_exit_pts if partial_exit_pts is not None else target_pts_for_trade / 2.0
             )
             partial_taken = False
-            highest_price_since_entry = h
+            highest_price_since_entry = entry_price
             deferred_long = False
             deferred_short = False
         elif deferred_short and position == 0:
-            entry_price = l_  # worst-case short fill = bar low
+            if _1m_bars_for_5m is not None and k in _1m_bars_for_5m:
+                s1, _ = _1m_bars_for_5m[k]
+                entry_price = float(_1m_low[s1])  # first 1m bar's low
+            else:
+                entry_price = l_  # fallback to 5m bar low
             entry_ts = ts
             position = -deferred_entry_contracts
             target_pts_for_trade = deferred_target_pts or target_pts
@@ -731,7 +740,7 @@ def run_topstep_nq(
                 partial_exit_pts if partial_exit_pts is not None else target_pts_for_trade / 2.0
             )
             partial_taken = False
-            highest_price_since_entry = l_
+            highest_price_since_entry = entry_price
             deferred_short = False
             deferred_long = False
 
@@ -994,8 +1003,9 @@ def run_topstep_nq(
                         exit_price = target_level
                         break
 
-                    # Ratchet trailing stop after each 1m bar
-                    highest_price_since_entry = max(highest_price_since_entry or bh, bh)
+                    # Ratchet trailing stop on bar CLOSE (not high — avoids look-ahead bias)
+                    bc = bar_closes[bi]
+                    highest_price_since_entry = max(highest_price_since_entry or bc, bc)
                     if breakeven_stop_pts is not None:
                         if highest_price_since_entry - entry_price >= breakeven_stop_pts:
                             stop_level = max(stop_level, entry_price)
@@ -1050,8 +1060,9 @@ def run_topstep_nq(
                         exit_price = target_level
                         break
 
-                    # Ratchet trailing stop after each 1m bar
-                    highest_price_since_entry = min(highest_price_since_entry or bl, bl)
+                    # Ratchet trailing stop on bar CLOSE (not low — avoids look-ahead bias)
+                    bc = bar_closes[bi]
+                    highest_price_since_entry = min(highest_price_since_entry or bc, bc)
                     if breakeven_stop_pts is not None:
                         if entry_price - highest_price_since_entry >= breakeven_stop_pts:
                             stop_level = min(stop_level, entry_price)
