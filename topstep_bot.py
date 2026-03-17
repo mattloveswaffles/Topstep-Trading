@@ -155,7 +155,7 @@ EVAL_CONFIG = {
     "rsi_oversold_max": 50.0,           # effectively disabled
     "rsi_overbought_min": 50.0,         # effectively disabled
     "day_bias_filter": False,           # no day bias -- trade any day
-    "trailing_stop_pts": 2.0,           # trail stop 2 pts behind best price
+    "trailing_stop_pts": 3.0,           # trail stop 2 pts behind best price
     "long_only": False,                 # trade both long and short
     "max_daily_pnl": 1600.0,           # stop trading once daily PnL hits $1600
 }
@@ -170,7 +170,7 @@ FUNDED_CONFIG = {
     "rsi_oversold_max": 50.0,
     "rsi_overbought_min": 50.0,
     "day_bias_filter": False,
-    "trailing_stop_pts": 2.0,
+    "trailing_stop_pts": 3.0,
     "long_only": False,
     "max_daily_pnl": 1600.0,
 }
