@@ -422,13 +422,8 @@ class ProjectXAPI:
         size: int,
         stop_loss_ticks: Optional[int] = None,
         take_profit_ticks: Optional[int] = None,
-        trailing_stop: bool = False,
     ) -> Dict:
-        """Place a market order with optional bracket orders.
-
-        If trailing_stop=True, the stop loss bracket uses TrailingStop type (5)
-        so the exchange automatically trails the stop.
-        """
+        """Place a market order with optional bracket orders."""
         self.ensure_auth()
         payload = {
             "accountId": account_id,
@@ -439,8 +434,7 @@ class ProjectXAPI:
         }
 
         if stop_loss_ticks is not None:
-            stop_type = OrderType.TRAILING_STOP if trailing_stop else OrderType.STOP
-            payload["stopLossBracket"] = {"ticks": stop_loss_ticks, "type": stop_type}
+            payload["stopLossBracket"] = {"ticks": stop_loss_ticks, "type": OrderType.STOP}
         if take_profit_ticks is not None:
             payload["takeProfitBracket"] = {"ticks": take_profit_ticks, "type": OrderType.LIMIT}
 
@@ -1885,6 +1879,10 @@ class TradingEngine:
         last_price = data.get("lastPrice")
         if last_price is not None:
             self._last_price = float(last_price)
+            # Trail stop on every price tick for all accounts with open positions
+            for acc in self.accounts.values():
+                if acc.position != 0:
+                    self._trail_stop(acc, self._last_price)
 
     # -- State Persistence -------------------------------------------------
 
@@ -2093,8 +2091,9 @@ class TradingEngine:
     # -- Daily Reset -------------------------------------------------------
 
     def _check_new_day(self):
-        """Reset daily state when the date rolls over."""
-        today_str = str(self._now_et().date())
+        """Reset daily state when the trading day rolls over (6 PM ET = Asia open)."""
+        now_et = self._now_et()
+        today_str = str(self._futures_session_date(now_et))
         for acc in self.accounts.values():
             if acc.today == today_str:
                 continue
@@ -2250,7 +2249,9 @@ class TradingEngine:
         # Use real-time price if available, fallback to bar close
         current_price = getattr(self, '_last_price', None) or (_bar_close(bars[-1]) if bars else None)
 
-        # Exchange handles trailing stop natively — just wait for fill
+        # Trail the stop on every cycle when in a position (regardless of other guards)
+        if acc.position != 0 and current_price is not None:
+            self._trail_stop(acc, current_price)
         if acc.position != 0:
             return
 
@@ -2307,9 +2308,8 @@ class TradingEngine:
 
         prev_day_close = self._get_prev_day_close()
 
-        # Check for new entry — use native trailing stop (exchange-managed)
-        trail_pts = EVAL_CONFIG.get("trailing_stop_pts", EVAL_CONFIG["stop_pts"])
-        trail_ticks = pts_to_ticks(trail_pts)
+        # Check for new entry
+        stop_ticks = pts_to_ticks(EVAL_CONFIG["stop_pts"])
         target_ticks = pts_to_ticks(EVAL_CONFIG["target_pts"])
         qty = EVAL_CONFIG["contracts"]
 
@@ -2319,11 +2319,10 @@ class TradingEngine:
                 side=OrderSide.BID,
                 contracts=qty,
                 entry_price=current_price,
-                stop_pts=trail_pts,
+                stop_pts=EVAL_CONFIG["stop_pts"],
                 target_pts=EVAL_CONFIG["target_pts"],
-                stop_ticks=-trail_ticks,
+                stop_ticks=-stop_ticks,
                 target_ticks=target_ticks,
-                trailing_stop=True,
             )
         elif (not EVAL_CONFIG.get("long_only", True)
               and check_vwap_mr_short_entry(bars, EVAL_CONFIG, prev_day_close=prev_day_close)):
@@ -2332,12 +2331,76 @@ class TradingEngine:
                 side=OrderSide.ASK,
                 contracts=qty,
                 entry_price=current_price,
-                stop_pts=trail_pts,
+                stop_pts=EVAL_CONFIG["stop_pts"],
                 target_pts=EVAL_CONFIG["target_pts"],
-                stop_ticks=trail_ticks,
+                stop_ticks=stop_ticks,
                 target_ticks=-target_ticks,
-                trailing_stop=True,
             )
+
+    def _trail_stop(self, acc: AccountState, current_price: float):
+        """Ratchet the trailing stop and modify the exchange stop order.
+
+        Called on every poll cycle when in a position. Entry places a fixed stop.
+        Once price moves enough, we tighten it by modifying the stop on the exchange.
+        """
+        trail_pts = EVAL_CONFIG.get("trailing_stop_pts")
+        new_stop = None
+
+        if acc.position > 0:
+            acc.highest_price_since_entry = max(acc.highest_price_since_entry, current_price)
+            if trail_pts is not None:
+                trail_stop = round(round((acc.highest_price_since_entry - trail_pts) / TICK_SIZE) * TICK_SIZE, 2)
+                if trail_stop > acc.stop_price:
+                    new_stop = trail_stop
+                    acc.stop_price = trail_stop
+        else:
+            acc.highest_price_since_entry = min(acc.highest_price_since_entry, current_price)
+            if trail_pts is not None:
+                trail_stop = round(round((acc.highest_price_since_entry + trail_pts) / TICK_SIZE) * TICK_SIZE, 2)
+                if trail_stop < acc.stop_price:
+                    new_stop = trail_stop
+                    acc.stop_price = trail_stop
+
+        if new_stop is None:
+            return
+
+        if acc.stop_order_id is not None:
+            self._modify_stop_on_exchange(acc, new_stop)
+        else:
+            self._find_and_modify_stop(acc, new_stop)
+
+    def _modify_stop_on_exchange(self, acc: AccountState, new_stop: float):
+        """Modify a known stop order to a new price."""
+        try:
+            self.api.modify_order(
+                account_id=acc.account_id,
+                order_id=acc.stop_order_id,
+                stop_price=new_stop,
+            )
+            log.info(
+                f"Trail stop moved on exchange: order {acc.stop_order_id} "
+                f"-> {new_stop:.2f} (high={acc.highest_price_since_entry:.2f})"
+            )
+            self._log_activity(f"Stop moved -> {new_stop:.2f} (best: {acc.highest_price_since_entry:.2f})", "cyan")
+        except Exception as e:
+            log.error(f"Failed to modify stop order: {e}", exc_info=True)
+
+    def _find_and_modify_stop(self, acc: AccountState, new_stop: float):
+        """Find the stop order ID from open orders and modify it."""
+        try:
+            orders = self.api.get_open_orders(acc.account_id)
+            for o in orders:
+                if o.get("type") == OrderType.STOP:
+                    acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
+                    self.api.modify_order(
+                        account_id=acc.account_id,
+                        order_id=acc.stop_order_id,
+                        stop_price=new_stop,
+                    )
+                    log.info(f"Found & moved stop order {acc.stop_order_id} -> {new_stop:.2f}")
+                    break
+        except Exception as e:
+            log.error(f"Failed to find/modify stop order: {e}", exc_info=True)
 
     def _trade_funded(self, acc: AccountState):
         """VWAP Micro MR strategy for funded accounts."""
@@ -2356,7 +2419,9 @@ class TradingEngine:
 
         current_price = getattr(self, '_last_price', None) or (_bar_close(bars[-1]) if bars else None)
 
-        # Exchange handles trailing stop natively — just wait for fill
+        # Trail the stop on every cycle when in a position
+        if acc.position != 0 and current_price is not None:
+            self._trail_stop(acc, current_price)
         if acc.position != 0:
             return
 
@@ -2413,9 +2478,8 @@ class TradingEngine:
 
         prev_day_close = self._get_prev_day_close()
 
-        # Check for new entry — use native trailing stop (exchange-managed)
-        trail_pts = cfg.get("trailing_stop_pts", cfg["stop_pts"])
-        trail_ticks = pts_to_ticks(trail_pts)
+        # Check for new entry
+        stop_ticks = pts_to_ticks(cfg["stop_pts"])
         target_ticks = pts_to_ticks(cfg["target_pts"])
         qty = cfg["contracts"]
 
@@ -2425,11 +2489,10 @@ class TradingEngine:
                 side=OrderSide.BID,
                 contracts=qty,
                 entry_price=current_price,
-                stop_pts=trail_pts,
+                stop_pts=cfg["stop_pts"],
                 target_pts=cfg["target_pts"],
-                stop_ticks=-trail_ticks,
+                stop_ticks=-stop_ticks,
                 target_ticks=target_ticks,
-                trailing_stop=True,
             )
         elif (not cfg.get("long_only", True)
               and check_vwap_mr_short_entry(bars, cfg, prev_day_close=prev_day_close)):
@@ -2438,11 +2501,10 @@ class TradingEngine:
                 side=OrderSide.ASK,
                 contracts=qty,
                 entry_price=current_price,
-                stop_pts=trail_pts,
+                stop_pts=cfg["stop_pts"],
                 target_pts=cfg["target_pts"],
-                stop_ticks=trail_ticks,
+                stop_ticks=stop_ticks,
                 target_ticks=-target_ticks,
-                trailing_stop=True,
             )
 
     # -- Order Execution ---------------------------------------------------
@@ -2457,7 +2519,6 @@ class TradingEngine:
         target_pts: Optional[float] = None,
         stop_ticks: Optional[int] = None,
         target_ticks: Optional[int] = None,
-        trailing_stop: bool = False,
     ):
         """Open a position via market order with optional brackets."""
         try:
@@ -2468,7 +2529,6 @@ class TradingEngine:
                 size=contracts,
                 stop_loss_ticks=stop_ticks,
                 take_profit_ticks=target_ticks,
-                trailing_stop=trailing_stop,
             )
 
             acc.position = contracts if side == OrderSide.BID else -contracts
@@ -2484,23 +2544,27 @@ class TradingEngine:
             acc.trades_today += 1
             acc.trades_this_session += 1
 
-            # Capture stop order ID (for cleanup on close) — RT events will also set this
-            try:
-                time.sleep(0.5)
-                orders = self.api.get_open_orders(acc.account_id)
-                for o in orders:
-                    if o.get("type") in (OrderType.STOP, OrderType.TRAILING_STOP):
-                        acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
-                        log.info(f"Captured stop order ID: {acc.stop_order_id}")
+            # Retry up to 3 times to capture stop order ID for trailing stop
+            for attempt in range(1, 4):
+                try:
+                    time.sleep(0.5 * attempt)  # 0.5s, 1s, 1.5s
+                    orders = self.api.get_open_orders(acc.account_id)
+                    for o in orders:
+                        if o.get("type") == OrderType.STOP:
+                            acc.stop_order_id = int(o.get("id", o.get("orderId", 0)))
+                            log.info(f"Captured stop order ID on attempt {attempt}: {acc.stop_order_id}")
+                            break
+                    if acc.stop_order_id is not None:
                         break
-            except Exception as e:
-                log.warning(f"Stop order ID capture failed: {e}")
+                except Exception as e:
+                    log.warning(f"Stop order ID fetch attempt {attempt}/3 failed: {e}")
+            if acc.stop_order_id is None:
+                log.warning(f"Could not capture stop order ID after 3 attempts -- trailing will search each cycle")
 
-            trail_str = " [TRAILING]" if trailing_stop else ""
             side_str = "BUY" if side == OrderSide.BID else "SELL"
             log.info(
                 f"OPENED: Acct {acc.account_id} | {side_str} {contracts}x NQ @ ~{entry_price:.2f} | "
-                f"SL={acc.stop_price:.2f} TP={acc.target_price:.2f}{trail_str}"
+                f"SL={acc.stop_price:.2f} TP={acc.target_price:.2f} [TRAILING]"
             )
             self._log_activity(
                 f"ENTRY: {side_str} {contracts}x @ {entry_price:.2f} | SL={acc.stop_price:.2f} TP={acc.target_price:.2f}",
