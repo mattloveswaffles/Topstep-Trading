@@ -2070,10 +2070,15 @@ class TradingEngine:
 
     def _sync_daily_pnl_from_api(self, acc: AccountState):
         """Sync daily PnL from trades (source of truth)."""
-        # Look back 24h to cover trading day (starts 6PM ET, could be prev UTC date)
-        today_start = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        # Trading day starts at 6 PM ET — compute that boundary in UTC
+        now_et = self._now_et()
+        if now_et.hour >= 18:
+            # After 6 PM ET today — trading day started today at 6 PM
+            day_start_et = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+        else:
+            # Before 6 PM ET — trading day started yesterday at 6 PM
+            day_start_et = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+        today_start = day_start_et.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         trades = self.api.get_trades(acc.account_id, today_start)
         total_pnl = 0.0
         total_fees = 0.0
