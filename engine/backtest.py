@@ -1282,7 +1282,7 @@ COMBINE_COST = 49.0
 
 def _precompute_day_stats(
     day_trades: List[pd.DataFrame],
-    day1_profit_cap: float = 1400.0,
+    day1_profit_cap: float = 1700.0,
     max_adverse_per_trade: float = 0.0,
 ) -> Dict[str, np.ndarray]:
     """Pre-compute per-day statistics for vectorized Monte Carlo.
@@ -1493,7 +1493,7 @@ def monte_carlo_topstep(
     n_simulations: int = 50_000,
     combine_cost: float = COMBINE_COST,
     random_seed: int = 42,
-    day1_profit_cap: float = 1400.0,
+    day1_profit_cap: float = 1700.0,
     total_calendar_days: int = 0,
     total_data_days: int = 0,
     max_adverse_per_trade: float = 0.0,
@@ -1527,13 +1527,23 @@ def monte_carlo_topstep(
 
     # Add zero-PnL entries for data days without trades (active but no signal).
     # These count as trading days in the sim — we showed up, just didn't trade.
-    if total_data_days > 0:
-        n_no_signal_days = max(0, total_data_days - n_trade_days)
-    else:
-        n_no_signal_days = 0
+    # If total_data_days not provided, estimate from the trade date range
+    # to avoid the bug where every sim day draws a real trade.
+    if total_data_days <= 0:
+        ts = trades["timestamp"]
+        date_span = (ts.max() - ts.min()).days
+        # Estimate ~5/7 of calendar days are market days
+        total_data_days = max(n_trade_days, int(date_span * 5 / 7))
+        if total_calendar_days <= 0:
+            total_calendar_days = max(date_span, total_data_days)
+    n_no_signal_days = max(0, total_data_days - n_trade_days)
     for _ in range(n_no_signal_days):
         day_trades.append(pd.DataFrame({"pnl": [0.0]}))
     n_days = len(day_trades)
+
+    # Compute avg trades per day (excluding zero-PnL padding days)
+    trades_per_day = [len(d) for d in day_trades[:n_trade_days]]
+    avg_trades_per_day = np.mean(trades_per_day) if trades_per_day else 0.0
 
     # Flat ratio = only market-closed days (weekends/holidays)
     # These burn a calendar day but do NOT count as a trading day.
@@ -1607,6 +1617,7 @@ def monte_carlo_topstep(
         ("Max Drawdown Distribution", dd_str),
         ("Average Calendar Days to Pass", avg_calendar_days_pass),
         ("Average Trading Days to Pass", avg_trading_days_pass),
+        ("Average Trades Per Day", avg_trades_per_day),
     ], columns=["Metric", "Value"])
 
     return summary_df, attempts_df
